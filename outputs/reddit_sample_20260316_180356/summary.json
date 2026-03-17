@@ -1,0 +1,15 @@
+{
+  "mode": "file",
+  "num_nodes": 10000,
+  "feature_dim": 602,
+  "embedding_dim": 64,
+  "num_snapshots": 6,
+  "initialization_latency_ms": 101.12830000000005,
+  "avg_update_latency_ms": 294.11529999999965,
+  "p95_update_latency_ms": 317.64229999999964,
+  "final_macro_f1": 0.12444714534702093,
+  "final_micro_f1": 0.25366666666666665,
+  "final_link_auc": 0.9095268249511719,
+  "quantization_compression_ratio": 7.9936051159072745,
+  "output_dir": "D:\\毕设资料\\algorithms\\outputs\\reddit_sample_20260316_180356"
+}

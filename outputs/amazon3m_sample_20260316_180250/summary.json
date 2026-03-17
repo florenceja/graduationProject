@@ -1,0 +1,15 @@
+{
+  "mode": "file",
+  "num_nodes": 10000,
+  "feature_dim": 8,
+  "embedding_dim": 64,
+  "num_snapshots": 6,
+  "initialization_latency_ms": 66.83000000000017,
+  "avg_update_latency_ms": 466.20669999999984,
+  "p95_update_latency_ms": 475.7174799999996,
+  "final_macro_f1": 0.05117486735368587,
+  "final_micro_f1": 0.8796666666666667,
+  "final_link_auc": 0.7820510864257812,
+  "quantization_compression_ratio": 7.9936051159072745,
+  "output_dir": "D:\\毕设资料\\algorithms\\outputs\\amazon3m_sample_20260316_180250"
+}

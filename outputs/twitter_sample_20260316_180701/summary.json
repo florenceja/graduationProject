@@ -1,0 +1,15 @@
+{
+  "mode": "file",
+  "num_nodes": 10000,
+  "feature_dim": 5,
+  "embedding_dim": 64,
+  "num_snapshots": 6,
+  "initialization_latency_ms": 69.48960000000004,
+  "avg_update_latency_ms": 495.0533800000002,
+  "p95_update_latency_ms": 500.9577000000003,
+  "final_macro_f1": 0.5530282622575292,
+  "final_micro_f1": 0.63,
+  "final_link_auc": 0.7427482604980469,
+  "quantization_compression_ratio": 7.9936051159072745,
+  "output_dir": "D:\\毕设资料\\algorithms\\outputs\\twitter_sample_20260316_180701"
+}
