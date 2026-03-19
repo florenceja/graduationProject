@@ -7,7 +7,7 @@
 - 数据预处理与格式对齐
 - 初始嵌入训练
 - 动态增量更新
-- 分类/链路预测评估
+- 分类/链路预测/网络重构评估
 - 实验结果导出
 
 适用于毕业设计、课程实验和方法验证，不是工业级分布式实现。
@@ -34,7 +34,8 @@ algorithms/
 │   ├── prepare_datasets.py       # 原始数据集 → 统一 CSV 格式
 │   ├── plot_metrics_svg.py       # 从 CSV 生成 SVG 曲线图
 │   ├── generate_thesis_conclusion.py  # 论文结论自动生成
-│   └── run_edane_experiment.py   # 轻量快速验证脚本
+│   ├── run_edane_experiment.py   # 轻量快速验证脚本
+│   └── run_stage23_experiments.py # 阶段2/3矩阵实验一键脚本
 ├── data/                         # 预处理后的数据集
 │   ├── reddit_sample/
 │   ├── amazon2m_sample/
@@ -52,15 +53,15 @@ algorithms/
    - 邻接矩阵预处理（对称化、去自环，并转为 CSR 稀疏矩阵）
    - 属性标准化
    - 随机投影矩阵采样
-   - 结构嵌入计算：`H_s = Σ α_k S^k R`
+   - 结构初始化：随机投影锚点 + 显式目标优化
    - 属性嵌入计算：`H_x = X W_x`
-   - 双曲空间门控融合
-   - 可选量化
+   - 可学习双曲门控融合
+   - int8 / 可选 binary 压缩
 
 2. `apply_updates(...)`
-   - 应用边增删和属性变更
+   - 支持节点增删、边增删和属性变更
    - 自动扩展受影响节点到一跳邻居
-   - 按局部近似规则更新结构嵌入
+   - 按文档主公式更新结构嵌入
    - 局部重算属性嵌入与融合向量
 
 ### 3.2 管线层（`src/edane_full_pipeline.py`）
@@ -90,12 +91,19 @@ algorithms/
 | 文件 | 说明 |
 |------|------|
 | `summary.json` | 整体实验摘要 |
-| `metrics_per_snapshot.csv` | 每快照指标与时延 |
+| `metrics_per_snapshot.csv` | 每快照指标与时延（含 AP / reconstruction AUC） |
 | `final_embedding.npy` | 最终浮点嵌入 |
 | `final_embedding_int8.npy` | 量化嵌入（开启 `--quantize` 时） |
 | `final_embedding_scale.npy` | 量化缩放系数 |
+| `final_embedding_binary.npy` | Binary 副本（若开启 `--binary-quantize`） |
 | `node_mapping.csv` | 节点 ID → 索引映射 |
 | `metrics_curves.svg` | 指标曲线图 |
+
+`summary.json` 现包含时延分解字段：
+
+- `avg_update_latency_ms`（端到端，含节流等待）
+- `avg_compute_update_latency_ms`（纯计算）
+- `avg_pacing_wait_ms`（节流等待）
 
 ## 5. 关键参数建议
 
@@ -122,6 +130,33 @@ algorithms/
 2. 在 `evaluate_snapshot()` 中计算并返回
 3. 同步更新 `metrics_per_snapshot.csv` 字段
 4. 如需可视化，更新 `save_metrics_curves_svg()` 或 `src/plot_metrics_svg.py`
+
+当前已内置：`macro_f1`、`micro_f1`、`link_auc`、`link_ap`、`reconstruction_auc`
+
+### 6.4 调整模块级超参数
+
+当前 `EDANE.__init__` 还支持：
+
+- 初始化模块：`structure_weights`、`init_iterations`、`init_step_size`、`init_reg`、`init_tol`
+- 融合模块：`fusion_train_steps`、`fusion_lr`、`fusion_weight_decay`
+- 存储模块：`binary_quantize`
+
+主流水线默认只暴露常用参数；更细控制可直接通过 Python API 实验，或继续扩展 CLI。
+
+### 6.5 阶段2/3实验矩阵复现
+
+使用 `src/run_stage23_experiments.py` 可一键得到：
+
+- 阶段2速率矩阵（默认 `10/100/1000`）
+- 阶段3消融矩阵（`full / w/o-Attr / w/o-Hyperbolic / w/o-Inc`）
+
+示例：
+
+```bash
+python src/run_stage23_experiments.py --mode file --dataset-preset reddit_sample --snapshots 3 --max-nodes 3000
+```
+
+输出：`stage2_rate_results.csv`、`stage3_ablation_results.csv`、`stage23_combined_results.csv`。
 
 ### 6.3 调整融合策略
 

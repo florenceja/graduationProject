@@ -19,6 +19,8 @@ def read_metrics(csv_path: str) -> List[Dict[str, float]]:
                     "macro_f1": float(row["macro_f1"]),
                     "micro_f1": float(row["micro_f1"]),
                     "link_auc": float(row["link_auc"]),
+                    "link_ap": float(row.get("link_ap", 0.0)),
+                    "reconstruction_auc": float(row.get("reconstruction_auc", 0.0)),
                 }
             )
     return rows
@@ -33,6 +35,8 @@ def save_metrics_curves_svg(metrics_rows: List[Dict[str, float]], output_path: s
         "macro_f1": [float(r["macro_f1"]) for r in metrics_rows],
         "micro_f1": [float(r["micro_f1"]) for r in metrics_rows],
         "link_auc": [float(r["link_auc"]) for r in metrics_rows],
+        "link_ap": [float(r["link_ap"]) for r in metrics_rows],
+        "reconstruction_auc": [float(r["reconstruction_auc"]) for r in metrics_rows],
     }
     latency = [float(r["update_latency_ms"]) for r in metrics_rows]
 
@@ -91,14 +95,20 @@ def save_metrics_curves_svg(metrics_rows: List[Dict[str, float]], output_path: s
         svg_lines.append(f'<line x1="{xx:.2f}" y1="{top_y0 + top_h}" x2="{xx:.2f}" y2="{bot_y0 + bot_h}" stroke="#f3f3f3"/>')
         svg_lines.append(f'<text x="{xx - 8:.2f}" y="{bot_y0 + bot_h + 18}" font-size="11" font-family="Arial">{int(round(xv))}</text>')
 
-    colors = {"macro_f1": "#1f77b4", "micro_f1": "#2ca02c", "link_auc": "#d62728"}
+    colors = {
+        "macro_f1": "#1f77b4",
+        "micro_f1": "#2ca02c",
+        "link_auc": "#d62728",
+        "link_ap": "#ff7f0e",
+        "reconstruction_auc": "#17becf",
+    }
     for name, values in top_series.items():
         points = [(sx(x), sy_top(y)) for x, y in zip(xs, values)]
         svg_lines.append(polyline(points, colors[name]))
     lat_points = [(sx(x), sy_bot(y)) for x, y in zip(xs, latency)]
     svg_lines.append(polyline(lat_points, "#9467bd"))
 
-    svg_lines.append(f'<text x="{margin_l}" y="{top_y0 - 12}" font-size="13" font-family="Arial">F1/AUC over snapshots</text>')
+    svg_lines.append(f'<text x="{margin_l}" y="{top_y0 - 12}" font-size="13" font-family="Arial">F1 / ROC-AUC / AP over snapshots</text>')
     svg_lines.append(f'<text x="{margin_l}" y="{bot_y0 - 12}" font-size="13" font-family="Arial">Update latency (ms)</text>')
     svg_lines.append("</svg>")
 

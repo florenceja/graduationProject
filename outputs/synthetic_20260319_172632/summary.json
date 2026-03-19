@@ -1,0 +1,23 @@
+{
+  "mode": "synthetic",
+  "num_nodes": 600,
+  "feature_dim": 24,
+  "embedding_dim": 64,
+  "num_snapshots": 5,
+  "initialization_latency_ms": 29.525800000000046,
+  "avg_update_latency_ms": 4.190450000000012,
+  "p95_update_latency_ms": 4.486850000000015,
+  "final_macro_f1": 0.9769554866026439,
+  "final_micro_f1": 0.9777777777777777,
+  "final_link_auc": 0.8475112915039062,
+  "final_link_ap": 0.8443238398498703,
+  "final_reconstruction_auc": 0.8662443161010742,
+  "ablation_tag": "w/o-Attr",
+  "update_rate": 0,
+  "effective_update_rate": 1193.1892756147872,
+  "quantization_compression_ratio": 7.894736842105263,
+  "quantization_error": 0.004872319862712864,
+  "binary_compression_ratio": 1.0,
+  "binary_error": 0.0,
+  "output_dir": "D:\\毕设资料\\algorithms\\outputs\\synthetic_20260319_172632"
+}

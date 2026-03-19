@@ -2,7 +2,7 @@
 
 用途：
 - 快速演示算法在合成动态属性图上的完整流程
-- 输出初始化时延、增量更新时延、分类与链路预测指标
+- 输出初始化时延、增量更新时延、分类 / 链路预测 / 网络重构指标
 - 便于在没有真实数据时先做功能自检
 """
 
@@ -112,8 +112,8 @@ def sample_link_pairs(adj: np.ndarray, sample_size: int, seed: int) -> Tuple[Lis
     pos_idx = rng.choice(len(pos), size=min(sample_size, len(pos)), replace=False)
     neg_idx = rng.choice(len(neg), size=min(sample_size, len(neg)), replace=False)
 
-    pos_pairs = [tuple(map(int, pair)) for pair in pos[pos_idx]]
-    neg_pairs = [tuple(map(int, pair)) for pair in neg[neg_idx]]
+    pos_pairs = [(int(pair[0]), int(pair[1])) for pair in pos[pos_idx]]
+    neg_pairs = [(int(pair[0]), int(pair[1])) for pair in neg[neg_idx]]
     return pos_pairs, neg_pairs
 
 
@@ -124,26 +124,54 @@ def auc_from_scores(pos_scores: np.ndarray, neg_scores: np.ndarray) -> float:
     return float(np.mean(comparisons + ties))
 
 
+def average_precision_from_scores(pos_scores: np.ndarray, neg_scores: np.ndarray) -> float:
+    """根据正负样本得分计算 Average Precision。"""
+    if len(pos_scores) == 0 or len(neg_scores) == 0:
+        return 0.0
+    y_true = np.concatenate([np.ones(len(pos_scores), dtype=np.int64), np.zeros(len(neg_scores), dtype=np.int64)])
+    y_score = np.concatenate([pos_scores, neg_scores])
+    order = np.argsort(-y_score, kind="mergesort")
+    y_true = y_true[order]
+    pos_total = int(np.sum(y_true))
+    if pos_total == 0:
+        return 0.0
+    tp = 0
+    precisions: List[float] = []
+    for rank, label in enumerate(y_true, start=1):
+        if label == 1:
+            tp += 1
+            precisions.append(tp / rank)
+    return float(np.sum(precisions) / pos_total)
+
+
 def evaluate_embedding(
     embedding: np.ndarray,
     labels: np.ndarray,
     adj: np.ndarray,
     seed: int,
 ) -> Dict[str, float]:
-    """在当前快照上评估分类和链路预测效果。"""
+    """在当前快照上评估分类、链路预测与网络重构效果。"""
     train_idx, test_idx = train_test_split(len(labels), train_ratio=0.6, seed=seed)
-    pred = nearest_centroid_predict(embedding.copy(), labels, train_idx, test_idx)
+    pred = nearest_centroid_predict(embedding.copy(), labels, train_idx.tolist(), test_idx.tolist())
     macro_f1, micro_f1 = macro_micro_f1(labels[test_idx], pred)
 
     pos_pairs, neg_pairs = sample_link_pairs(adj, sample_size=512, seed=seed)
     pos_scores = cosine_scores(embedding, pos_pairs)
     neg_scores = cosine_scores(embedding, neg_pairs)
     auc = auc_from_scores(pos_scores, neg_scores)
+    ap = average_precision_from_scores(pos_scores, neg_scores)
+
+    recon_pos_pairs, recon_neg_pairs = sample_link_pairs(adj, sample_size=1024, seed=seed + 1000)
+    recon_pos_scores = cosine_scores(embedding, recon_pos_pairs)
+    recon_neg_scores = cosine_scores(embedding, recon_neg_pairs)
+    reconstruction_auc = auc_from_scores(recon_pos_scores, recon_neg_scores)
 
     return {
         "macro_f1": macro_f1,
         "micro_f1": micro_f1,
         "link_auc": auc,
+        "link_ap": ap,
+        "reconstruction_auc": reconstruction_auc,
     }
 
 
@@ -230,14 +258,6 @@ def main() -> None:
     updated_embedding = model.get_embedding(dequantize=False)
     updated_metrics = evaluate_embedding(updated_embedding, labels, dynamic_adj, seed=2)
 
-    quantized = model.quantized_embedding_
-    if quantized is None:
-        compression_ratio = 1.0
-    else:
-        float_bytes = updated_embedding.nbytes
-        quantized_bytes = quantized.values.nbytes + quantized.scale.nbytes
-        compression_ratio = float_bytes / max(quantized_bytes, 1)
-
     print("EDANE experiment summary")
     print("=" * 40)
     print(f"nodes: {adj.shape[0]}")
@@ -255,7 +275,8 @@ def main() -> None:
     for key, value in updated_metrics.items():
         print(f"{key}: {value:.4f}")
     print("-" * 40)
-    print(f"quantization_compression_ratio: {compression_ratio:.3f}x")
+    print(f"quantization_compression_ratio: {getattr(model, 'quantization_compression_ratio_', 1.0):.3f}x")
+    print(f"quantization_error: {getattr(model, 'quantization_error_', 0.0):.6f}")
 
 
 if __name__ == "__main__":

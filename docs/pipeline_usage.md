@@ -5,6 +5,7 @@
 | 脚本 | 路径 | 职责 |
 |------|------|------|
 | 实验主脚本 | `src/edane_full_pipeline.py` | 端到端实验流水线 |
+| 阶段2/3矩阵脚本 | `src/run_stage23_experiments.py` | 批量运行更新频率与消融实验并自动汇总 |
 | 算法核心 | `src/edane.py` | EDANE 模型定义 |
 | 数据整理 | `src/prepare_datasets.py` | 原始数据 → CSV 格式 |
 | 曲线绘图 | `src/plot_metrics_svg.py` | CSV → SVG 曲线图 |
@@ -20,7 +21,7 @@
 | `mag_sample` | `data/mag_sample/` | MAG 学术引用网络子图 |
 | `twitter_sample` | `data/twitter_sample/` | Twitter 社交网络子图 |
 
-每个目录包含：`edges.csv`、`features.csv`、`labels.csv`、`attr_updates.csv`（部分可选）
+每个目录包含：`edges.csv`、`features.csv`、`labels.csv`，以及可选的 `attr_updates.csv`。
 
 ## 3. 支持的两种模式
 
@@ -36,6 +37,8 @@ python src/edane_full_pipeline.py --mode synthetic --quantize
 
 ```bash
 python src/edane_full_pipeline.py --mode file --dataset-preset reddit_sample --snapshots 6 --quantize
+python src/edane_full_pipeline.py --mode file --dataset-preset reddit_sample --snapshots 6 --quantize --binary-quantize
+python src/edane_full_pipeline.py --mode file --dataset-preset reddit_sample --snapshots 6 --quantize --update-rate 100
 python src/edane_full_pipeline.py --mode file --dataset-preset amazon2m_sample --snapshots 6 --quantize
 python src/edane_full_pipeline.py --mode file --dataset-preset mag_sample --snapshots 6 --quantize
 python src/edane_full_pipeline.py --mode file --dataset-preset twitter_sample --snapshots 6 --quantize
@@ -46,6 +49,19 @@ python src/edane_full_pipeline.py --mode file --dataset-preset amazon3m_sample -
 
 ```bash
 python src/edane_full_pipeline.py --mode file --dataset-preset reddit_sample --snapshots 6 --classifier logreg --quantize
+```
+
+消融实验（阶段3）示例：
+
+```bash
+# EDANE-w/o-Attr
+python src/edane_full_pipeline.py --mode file --dataset-preset reddit_sample --snapshots 6 --quantize --no-attr
+
+# EDANE-w/o-Hyperbolic
+python src/edane_full_pipeline.py --mode file --dataset-preset reddit_sample --snapshots 6 --quantize --no-hyperbolic
+
+# EDANE-w/o-Inc（每个快照全量重训练）
+python src/edane_full_pipeline.py --mode file --dataset-preset reddit_sample --snapshots 6 --quantize --no-inc
 ```
 
 #### 方式 B：手动指定文件路径
@@ -125,11 +141,12 @@ time,node_id,f1,f2,f3
 
 | 文件 | 说明 |
 |------|------|
-| `summary.json` | 整体实验摘要（时延、最终指标、压缩比） |
-| `metrics_per_snapshot.csv` | 每个快照的指标与更新时间 |
+| `summary.json` | 整体实验摘要（时延、F1、AUC/AP、重构AUC、压缩比/误差） |
+| `metrics_per_snapshot.csv` | 每个快照的指标与更新时间（含 `link_ap`、`reconstruction_auc`） |
 | `final_embedding.npy` | 最终浮点嵌入 |
 | `final_embedding_int8.npy` | 量化后的嵌入（开启 `--quantize` 时） |
 | `final_embedding_scale.npy` | 量化缩放系数 |
+| `final_embedding_binary.npy` | Binary 副本（若开启 `--binary-quantize`） |
 | `node_mapping.csv` | 原始节点 ID → 索引映射 |
 | `metrics_curves.svg` | 指标曲线图 |
 
@@ -141,6 +158,7 @@ time,node_id,f1,f2,f3
 | `--order` | 结构传播阶数 | 2 |
 | `--projection-density` | 随机投影稀疏度 | 0.12 |
 | `--learning-rate` | 增量更新率 | 0.55 |
+| `--update-rate` | 目标变化速率（次/秒，0=不控制） | 0 |
 | `--snapshots` | 时间切分快照数 | 8 |
 | `--snapshot-mode` | `window` 或 `cumulative` | window |
 | `--max-nodes` | file 模式最大节点数（0=不限制） | 10000 |
@@ -150,18 +168,48 @@ time,node_id,f1,f2,f3
 | `--logreg-lr` | 逻辑回归学习率 | 0.35 |
 | `--logreg-weight-decay` | 逻辑回归权重衰减 | 1e-4 |
 | `--quantize` | 开启 int8 量化 | 关 |
+| `--binary-quantize` | 同步生成 Binary 副本 | 关 |
+| `--no-attr` | 消融：禁用属性融合（w/o-Attr） | 关 |
+| `--no-hyperbolic` | 消融：禁用双曲融合，改欧氏门控融合（w/o-Hyperbolic） | 关 |
+| `--no-inc` | 消融：禁用增量更新，改为每快照全量重训练（w/o-Inc） | 关 |
 | `--seed` | 随机种子 | 42 |
 
 ## 8. 补充说明
 
 - 当前实现已切换为 CSR 稀疏邻接后端（依赖 SciPy），可显著降低大图内存占用。安装：`pip install scipy`。
 - 该代码是"从数据预处理到实验评估"的系统化研究原型，适合毕业设计实验与论文撰写。
-- `MAG-` 原始数据体量极大，`mag_sample` 使用了节点/边抽样，并用结构统计构造轻量特征。
-- `twitter` 原始数据缺少标准属性与标签，`twitter_sample` 采用结构统计特征和度分桶伪标签。
-- `Amazon-3M.raw` 是极端多标签分类数据集（约 280 万商品），`amazon3m_sample` 通过共享标签（co-label）关系构建商品图，特征采用文本统计量。
+- `MAG-` 原始数据体量极大，`mag_sample` 使用了节点/边抽样；在内存允许时优先尝试真实属性列，否则回退到轻量结构特征。
+- `twitter_sample` 当前优先使用 `twitter_sampled/twitter.tar.gz` 中的 `.feat/.egofeat/.featnames/.circles/.edges` 构造真实属性图与圈层标签，不再使用早期的度分桶伪标签方案。
+- `amazon3m_sample` 通过共享标签（co-label）关系构建商品图，特征使用文本统计量 + 稳定哈希词袋，标签使用 `target_rel` 最强对应的 `target_ind`。
 
 若你已有历史结果目录，只想补画曲线图：
 
 ```bash
 python src/plot_metrics_svg.py --metrics-csv outputs/xxx/metrics_per_snapshot.csv
 ```
+
+## 9. 阶段2/3矩阵实验（一键）
+
+```bash
+# 文件数据：阶段2(10/100/1000) + 阶段3(full/w-o-Attr/w-o-Hyperbolic/w-o-Inc)
+python src/run_stage23_experiments.py --mode file --dataset-preset reddit_sample --snapshots 3 --max-nodes 3000
+
+# 需要把 w/o-Inc 也纳入阶段2速率对照时：
+python src/run_stage23_experiments.py --mode file --dataset-preset reddit_sample --snapshots 3 --max-nodes 3000 --include-no-inc-stage2
+
+# 快速自检（synthetic）：
+python src/run_stage23_experiments.py --mode synthetic --snapshots 2 --stage2-rates 10,100 --synthetic-rounds 6
+```
+
+输出目录示例：`outputs/stage23_matrix_reddit_sample_20260319_180000/`
+
+- `stage2_rate_results.csv`
+- `stage3_ablation_results.csv`
+- `stage23_combined_results.csv`
+
+说明：
+
+- `avg_update_latency_ms` 为端到端时延（包含速率节流等待）；
+- `avg_compute_update_latency_ms` 为纯计算时延（不含节流等待）；
+- `avg_pacing_wait_ms` 为节流等待时延；
+- 矩阵结果同时记录 `dataset_preset/snapshot_mode/seed/classifier`，便于跨次实验公平对比。

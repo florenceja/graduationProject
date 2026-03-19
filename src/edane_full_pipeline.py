@@ -4,7 +4,7 @@
 1) 数据读取与清洗（CSV -> 图/特征/标签）
 2) 动态快照构建（window / cumulative）
 3) EDANE 初始化与增量更新
-4) 评估（分类 F1 + 链路预测 AUC）
+4) 评估（分类 F1 + 链路预测 AUC/AP + 网络重构 AUC）
 5) 结果落盘（summary / 指标明细 / 嵌入 / 节点映射）
 """
 
@@ -165,7 +165,7 @@ def sample_link_pairs(adj: AdjLike, sample_size: int, seed: int) -> Tuple[List[T
         pos_candidates = np.column_stack([coo.row, coo.col])
         pos_take = min(sample_size, len(pos_candidates))
         pos_idx = rng.choice(len(pos_candidates), size=pos_take, replace=False)
-        pos_pairs = [tuple(map(int, row)) for row in pos_candidates[pos_idx]]
+        pos_pairs = [(int(row[0]), int(row[1])) for row in pos_candidates[pos_idx]]
 
         edge_set = set((int(u), int(v)) for u, v in pos_candidates.tolist())
         neg_pairs: List[Tuple[int, int]] = []
@@ -186,16 +186,17 @@ def sample_link_pairs(adj: AdjLike, sample_size: int, seed: int) -> Tuple[List[T
             trials += 1
         return pos_pairs, neg_pairs
 
-    pos_candidates = np.argwhere(np.triu(adj, 1) > 0.0)
-    neg_candidates = np.argwhere(np.triu(1.0 - adj - np.eye(n), 1) > 0.0)
+    dense_adj = np.asarray(adj, dtype=np.float64)
+    pos_candidates = np.argwhere(np.triu(dense_adj, 1) > 0.0)
+    neg_candidates = np.argwhere(np.triu(1.0 - dense_adj - np.eye(n), 1) > 0.0)
     if len(pos_candidates) == 0 or len(neg_candidates) == 0:
         return [], []
     pos_take = min(sample_size, len(pos_candidates))
     neg_take = min(sample_size, len(neg_candidates))
     pos_idx = rng.choice(len(pos_candidates), size=pos_take, replace=False)
     neg_idx = rng.choice(len(neg_candidates), size=neg_take, replace=False)
-    pos_pairs = [tuple(map(int, row)) for row in pos_candidates[pos_idx]]
-    neg_pairs = [tuple(map(int, row)) for row in neg_candidates[neg_idx]]
+    pos_pairs = [(int(row[0]), int(row[1])) for row in pos_candidates[pos_idx]]
+    neg_pairs = [(int(row[0]), int(row[1])) for row in neg_candidates[neg_idx]]
     return pos_pairs, neg_pairs
 
 
@@ -208,6 +209,29 @@ def auc_from_scores(pos_scores: np.ndarray, neg_scores: np.ndarray) -> float:
     return float(np.mean(comparisons + ties))
 
 
+def average_precision_from_scores(pos_scores: np.ndarray, neg_scores: np.ndarray) -> float:
+    """根据正负样本得分计算 Average Precision。"""
+    if len(pos_scores) == 0 or len(neg_scores) == 0:
+        return 0.0
+    y_true = np.concatenate(
+        [np.ones(len(pos_scores), dtype=np.int64), np.zeros(len(neg_scores), dtype=np.int64)]
+    )
+    y_score = np.concatenate([pos_scores, neg_scores])
+    order = np.argsort(-y_score, kind="mergesort")
+    y_true = y_true[order]
+
+    pos_total = int(np.sum(y_true))
+    if pos_total == 0:
+        return 0.0
+    tp = 0
+    precisions: List[float] = []
+    for rank, label in enumerate(y_true, start=1):
+        if label == 1:
+            tp += 1
+            precisions.append(tp / rank)
+    return float(np.sum(precisions) / pos_total)
+
+
 def evaluate_snapshot(
     embedding: np.ndarray,
     labels: np.ndarray,
@@ -218,12 +242,14 @@ def evaluate_snapshot(
     logreg_lr: float,
     logreg_weight_decay: float,
 ) -> Dict[str, float]:
-    """评估当前快照上的节点分类和链路预测指标。"""
+    """评估当前快照上的节点分类、链路预测与网络重构指标。"""
     valid_nodes = np.where(labels >= 0)[0]
     metrics: Dict[str, float] = {
         "macro_f1": 0.0,
         "micro_f1": 0.0,
         "link_auc": 0.0,
+        "link_ap": 0.0,
+        "reconstruction_auc": 0.0,
         "labeled_nodes": float(len(valid_nodes)),
     }
     if len(valid_nodes) > 10:
@@ -248,6 +274,12 @@ def evaluate_snapshot(
     pos_scores = cosine_scores(embedding, pos_pairs) if pos_pairs else np.array([], dtype=np.float64)
     neg_scores = cosine_scores(embedding, neg_pairs) if neg_pairs else np.array([], dtype=np.float64)
     metrics["link_auc"] = auc_from_scores(pos_scores, neg_scores)
+    metrics["link_ap"] = average_precision_from_scores(pos_scores, neg_scores)
+
+    recon_pos_pairs, recon_neg_pairs = sample_link_pairs(adj, sample_size=1024, seed=seed + 999)
+    recon_pos_scores = cosine_scores(embedding, recon_pos_pairs) if recon_pos_pairs else np.array([], dtype=np.float64)
+    recon_neg_scores = cosine_scores(embedding, recon_neg_pairs) if recon_neg_pairs else np.array([], dtype=np.float64)
+    metrics["reconstruction_auc"] = auc_from_scores(recon_pos_scores, recon_neg_scores)
     return metrics
 
 
@@ -279,6 +311,28 @@ def read_csv_dict(path: str) -> List[Dict[str, str]]:
         if reader.fieldnames is None:
             raise ValueError(f"CSV has no header: {path}")
         return [row for row in reader]
+
+
+def parse_numeric_vector(
+    row: Dict[str, str],
+    columns: Sequence[str],
+    context: str,
+) -> np.ndarray:
+    """将指定列解析为有限浮点向量，空值补 0。"""
+    values: List[float] = []
+    for column in columns:
+        raw = row.get(column)
+        text = "" if raw is None else raw.strip()
+        try:
+            values.append(float(text) if text != "" else 0.0)
+        except ValueError as exc:
+            raise ValueError(f"{context} 中列 {column} 的值无法解析为数值: {raw!r}") from exc
+    vec = np.asarray(values, dtype=np.float64)
+    if vec.ndim != 1 or vec.shape[0] != len(columns):
+        raise ValueError(f"{context} 维度非法，期望 {len(columns)} 维。")
+    if not np.all(np.isfinite(vec)):
+        raise ValueError(f"{context} 包含 NaN 或 Inf。")
+    return vec
 
 
 def build_graph_from_files(
@@ -328,15 +382,18 @@ def build_graph_from_files(
             if "node_id" not in feature_rows[0]:
                 raise ValueError("特征文件必须包含列: node_id,f1,f2,...")
             feature_cols = [c for c in feature_rows[0].keys() if c != "node_id"]
+            if len(feature_cols) == 0:
+                raise ValueError("特征文件至少需要一个数值特征列。")
             feature_dim = len(feature_cols)
-            for row in feature_rows:
+            for feature_row_idx, row in enumerate(feature_rows, start=2):
                 node = row["node_id"].strip()
                 if node == "":
                     continue
-                vals = []
-                for c in feature_cols:
-                    vals.append(float(row[c]) if row[c] not in ("", None) else 0.0)
-                feature_map[node] = np.array(vals, dtype=np.float64)
+                feature_map[node] = parse_numeric_vector(
+                    row,
+                    feature_cols,
+                    context=f"features.csv 第 {feature_row_idx} 行 node_id={node}",
+                )
                 node_ids.add(node)
 
     label_map: Dict[str, int] = {}
@@ -385,7 +442,7 @@ def build_graph_from_files(
     attrs[:] = 0.01 * rng.normal(size=attrs.shape)
     for node, vec in feature_map.items():
         if len(vec) != feature_dim:
-            continue
+            raise ValueError(f"节点 {node} 的特征维度为 {len(vec)}，与预期 {feature_dim} 不一致。")
         attrs[node_to_idx[node]] = vec
 
     labels = np.full(num_nodes, -1, dtype=np.int64)
@@ -436,6 +493,8 @@ def build_graph_from_files(
             if not required.issubset(set(attr_rows[0].keys())):
                 raise ValueError("属性更新文件必须包含列: time,node_id,f1,f2,...")
             feat_cols = [c for c in attr_rows[0].keys() if c not in ("time", "node_id")]
+            if len(feat_cols) == 0:
+                raise ValueError("属性更新文件至少需要一个数值特征列。")
             if len(feat_cols) != feature_dim:
                 raise ValueError("属性更新维度必须与 features 文件一致。")
             if has_time:
@@ -445,12 +504,16 @@ def build_graph_from_files(
                 )
             else:
                 boundaries = np.linspace(0, 1, len(snapshot_edge_sets) + 1)
-            for row in attr_rows:
+            for attr_row_idx, row in enumerate(attr_rows, start=2):
                 node = row["node_id"].strip()
                 if node not in node_to_idx:
                     continue
                 t = parse_time_value(row["time"])
-                vec = np.array([float(row[c]) if row[c] else 0.0 for c in feat_cols], dtype=np.float64)
+                vec = parse_numeric_vector(
+                    row,
+                    feat_cols,
+                    context=f"attr_updates.csv 第 {attr_row_idx} 行 node_id={node}",
+                )
                 bin_idx = len(snapshot_edge_sets) - 1
                 for i in range(len(snapshot_edge_sets)):
                     if boundaries[i] <= t <= boundaries[i + 1]:
@@ -482,6 +545,19 @@ def build_graph_from_files(
             )
         )
         prev_set = set(curr_set)
+
+    if attrs.shape != (num_nodes, feature_dim):
+        raise ValueError("attrs 矩阵形状非法。")
+    if not np.all(np.isfinite(attrs)):
+        raise ValueError("attrs 矩阵包含 NaN 或 Inf。")
+    for batch_idx, batch in enumerate(batches, start=1):
+        for node_idx, vec in batch.attr_updates.items():
+            if node_idx < 0 or node_idx >= num_nodes:
+                raise ValueError(f"第 {batch_idx} 个快照中的属性更新节点索引越界: {node_idx}")
+            if vec.ndim != 1 or vec.shape[0] != feature_dim:
+                raise ValueError(f"第 {batch_idx} 个快照中的属性更新维度非法。")
+            if not np.all(np.isfinite(vec)):
+                raise ValueError(f"第 {batch_idx} 个快照中的属性更新包含 NaN 或 Inf。")
 
     return adj0, attrs, labels, batches, node_to_idx
 
@@ -559,6 +635,8 @@ def save_metrics_curves_svg(metrics_rows: List[Dict[str, float]], output_path: s
         "macro_f1": [float(r["macro_f1"]) for r in metrics_rows],
         "micro_f1": [float(r["micro_f1"]) for r in metrics_rows],
         "link_auc": [float(r["link_auc"]) for r in metrics_rows],
+        "link_ap": [float(r["link_ap"]) for r in metrics_rows],
+        "reconstruction_auc": [float(r["reconstruction_auc"]) for r in metrics_rows],
     }
     latency = [float(r["update_latency_ms"]) for r in metrics_rows]
 
@@ -623,7 +701,13 @@ def save_metrics_curves_svg(metrics_rows: List[Dict[str, float]], output_path: s
         svg_lines.append(f'<text x="{xx - 8:.2f}" y="{bot_y0 + bot_h + 18}" font-size="11" font-family="Arial">{int(round(xv))}</text>')
 
     # Curves
-    colors = {"macro_f1": "#1f77b4", "micro_f1": "#2ca02c", "link_auc": "#d62728"}
+    colors = {
+        "macro_f1": "#1f77b4",
+        "micro_f1": "#2ca02c",
+        "link_auc": "#d62728",
+        "link_ap": "#ff7f0e",
+        "reconstruction_auc": "#17becf",
+    }
     for name, values in top_series.items():
         points = [(sx(x), sy_top(y)) for x, y in zip(xs, values)]
         svg_lines.append(polyline(points, colors[name]))
@@ -637,7 +721,14 @@ def save_metrics_curves_svg(metrics_rows: List[Dict[str, float]], output_path: s
 
     legend_x = width - 280
     legend_y = 28
-    legends = [("macro_f1", "#1f77b4"), ("micro_f1", "#2ca02c"), ("link_auc", "#d62728"), ("latency_ms", "#9467bd")]
+    legends = [
+        ("macro_f1", "#1f77b4"),
+        ("micro_f1", "#2ca02c"),
+        ("link_auc", "#d62728"),
+        ("link_ap", "#ff7f0e"),
+        ("reconstruction_auc", "#17becf"),
+        ("latency_ms", "#9467bd"),
+    ]
     for i, (name, color) in enumerate(legends):
         yy = legend_y + i * 18
         svg_lines.append(f'<line x1="{legend_x}" y1="{yy}" x2="{legend_x + 22}" y2="{yy}" stroke="{color}" stroke-width="2.2"/>')
@@ -649,10 +740,15 @@ def save_metrics_curves_svg(metrics_rows: List[Dict[str, float]], output_path: s
 
 
 _ALL_RESULTS_COLUMNS = [
-    "dataset", "run_dir", "mode", "num_nodes", "feature_dim", "embedding_dim",
+    "dataset", "run_dir", "mode", "dataset_preset", "snapshot_mode", "seed", "classifier",
+    "num_nodes", "feature_dim", "embedding_dim",
     "num_snapshots", "initialization_latency_ms", "avg_update_latency_ms",
+    "avg_compute_update_latency_ms", "avg_pacing_wait_ms",
     "p95_update_latency_ms", "final_macro_f1", "final_micro_f1",
-    "final_link_auc", "quantization_compression_ratio", "output_dir",
+    "final_link_auc", "final_link_ap", "final_reconstruction_auc",
+    "ablation_tag", "update_rate", "effective_update_rate",
+    "quantization_compression_ratio", "quantization_error",
+    "binary_compression_ratio", "binary_error", "output_dir",
 ]
 
 
@@ -693,6 +789,53 @@ def _build_run_tag(args: argparse.Namespace) -> str:
     if args.edges_path:
         return os.path.splitext(os.path.basename(args.edges_path))[0]
     return "custom"
+
+
+def _build_ablation_tag(args: argparse.Namespace) -> str:
+    """根据开关生成消融标签。"""
+    tags: list[str] = []
+    if args.no_attr:
+        tags.append("w/o-Attr")
+    if args.no_hyperbolic:
+        tags.append("w/o-Hyperbolic")
+    if args.no_inc:
+        tags.append("w/o-Inc")
+    return "+".join(tags) if tags else "full"
+
+
+def _count_batch_events(batch: DynamicBatch) -> int:
+    """统计一个快照批次中的事件数（边变化 + 属性变化）。"""
+    return int(len(batch.edge_additions) + len(batch.edge_removals) + len(batch.attr_updates))
+
+
+def _apply_batch_to_graph(
+    adj: sparse.csr_matrix,
+    attrs: np.ndarray,
+    batch: DynamicBatch,
+) -> tuple[sparse.csr_matrix, np.ndarray]:
+    """将一个动态批次作用到原始图与属性（用于 w/o-Inc 全量重训练）。"""
+    work = adj.tolil(copy=True)
+    for u, v in batch.edge_additions:
+        if u == v:
+            continue
+        work[u, v] = 1.0
+        work[v, u] = 1.0
+    for u, v in batch.edge_removals:
+        if u == v:
+            continue
+        work[u, v] = 0.0
+        work[v, u] = 0.0
+
+    next_adj = sparse.csr_matrix(work, dtype=np.float64)
+    next_adj.eliminate_zeros()
+    if next_adj.nnz > 0:
+        next_adj.data[:] = 1.0
+
+    next_attrs = attrs.copy()
+    for idx, value in batch.attr_updates.items():
+        if 0 <= idx < next_attrs.shape[0]:
+            next_attrs[idx] = value
+    return next_adj, next_attrs
 
 
 def run_pipeline(args: argparse.Namespace) -> None:
@@ -746,7 +889,10 @@ def run_pipeline(args: argparse.Namespace) -> None:
         projection_density=args.projection_density,
         learning_rate=args.learning_rate,
         quantize=args.quantize,
+        binary_quantize=args.binary_quantize,
         random_state=args.seed,
+        use_attr_fusion=not args.no_attr,
+        use_hyperbolic_fusion=not args.no_hyperbolic,
     )
 
     start = time.perf_counter()
@@ -772,15 +918,42 @@ def run_pipeline(args: argparse.Namespace) -> None:
     ]
 
     update_latencies = []
+    compute_update_latencies = []
+    pacing_waits = []
+    total_events = 0
+    total_update_wall_s = 0.0
+    state_adj = sparse.csr_matrix(adj, dtype=np.float64)
+    state_attrs = np.asarray(attrs, dtype=np.float64).copy()
     for i, batch in enumerate(batches, start=1):
         start = time.perf_counter()
-        model.apply_updates(
-            edge_additions=batch.edge_additions,
-            edge_removals=batch.edge_removals,
-            attr_updates=batch.attr_updates if len(batch.attr_updates) > 0 else None,
-        )
-        latency_ms = (time.perf_counter() - start) * 1000.0
+        if args.no_inc:
+            state_adj, state_attrs = _apply_batch_to_graph(state_adj, state_attrs, batch)
+            model.fit(state_adj, state_attrs)
+        else:
+            model.apply_updates(
+                edge_additions=batch.edge_additions,
+                edge_removals=batch.edge_removals,
+                attr_updates=batch.attr_updates if len(batch.attr_updates) > 0 else None,
+            )
+        compute_latency_s = time.perf_counter() - start
+        latency_s = compute_latency_s
+
+        wait_ms = 0.0
+        event_count = _count_batch_events(batch)
+        if args.update_rate > 0 and event_count > 0:
+            target_s = event_count / float(args.update_rate)
+            if latency_s < target_s:
+                wait_ms = (target_s - latency_s) * 1000.0
+                time.sleep(target_s - latency_s)
+                latency_s = target_s
+
+        latency_ms = latency_s * 1000.0
+        compute_latency_ms = compute_latency_s * 1000.0
         update_latencies.append(latency_ms)
+        compute_update_latencies.append(compute_latency_ms)
+        pacing_waits.append(wait_ms)
+        total_events += event_count
+        total_update_wall_s += latency_s
 
         emb = model.get_embedding(dequantize=False)
         metrics = evaluate_snapshot(
@@ -794,12 +967,15 @@ def run_pipeline(args: argparse.Namespace) -> None:
             logreg_weight_decay=args.logreg_weight_decay,
         )
         metrics_rows.append(
-            {
-                "snapshot": i,
-                "update_latency_ms": latency_ms,
-                **metrics,
-            }
-        )
+                {
+                    "snapshot": i,
+                    "update_latency_ms": latency_ms,
+                    "compute_update_latency_ms": compute_latency_ms,
+                    "simulated_wait_ms": wait_ms,
+                    "batch_events": event_count,
+                    **metrics,
+                }
+            )
 
     # ---- 结果导出 ----
     final_embedding = model.get_embedding(dequantize=False)
@@ -807,11 +983,26 @@ def run_pipeline(args: argparse.Namespace) -> None:
     if model.quantized_embedding_ is not None:
         np.save(os.path.join(out_dir, "final_embedding_int8.npy"), model.quantized_embedding_.values)
         np.save(os.path.join(out_dir, "final_embedding_scale.npy"), model.quantized_embedding_.scale)
+    binary_embedding = getattr(model, "binary_embedding_", None)
+    if binary_embedding is not None:
+        np.save(os.path.join(out_dir, "final_embedding_binary.npy"), binary_embedding.values)
 
     with open(os.path.join(out_dir, "metrics_per_snapshot.csv"), "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["snapshot", "update_latency_ms", "macro_f1", "micro_f1", "link_auc", "labeled_nodes"],
+            fieldnames=[
+                "snapshot",
+                "update_latency_ms",
+                "compute_update_latency_ms",
+                "simulated_wait_ms",
+                "batch_events",
+                "macro_f1",
+                "micro_f1",
+                "link_auc",
+                "link_ap",
+                "reconstruction_auc",
+                "labeled_nodes",
+            ],
         )
         writer.writeheader()
         for row in metrics_rows:
@@ -823,27 +1014,35 @@ def run_pipeline(args: argparse.Namespace) -> None:
         for node_id, idx in sorted(node_to_idx.items(), key=lambda x: x[1]):
             writer.writerow([node_id, idx])
 
-    quantized = model.quantized_embedding_
-    if quantized is None:
-        compression_ratio = 1.0
-    else:
-        float_bytes = final_embedding.nbytes
-        quantized_bytes = quantized.values.nbytes + quantized.scale.nbytes
-        compression_ratio = float_bytes / max(quantized_bytes, 1)
+    compression_ratio = float(getattr(model, "quantization_compression_ratio_", 1.0))
 
     summary = {
         "mode": args.mode,
+        "dataset_preset": args.dataset_preset if args.mode == "file" else "synthetic",
+        "snapshot_mode": args.snapshot_mode,
+        "seed": int(args.seed),
+        "classifier": args.classifier,
         "num_nodes": int(final_embedding.shape[0]),
         "feature_dim": int(attrs.shape[1]),
         "embedding_dim": int(final_embedding.shape[1]),
         "num_snapshots": int(len(metrics_rows)),
         "initialization_latency_ms": float(init_latency_ms),
         "avg_update_latency_ms": float(np.mean(update_latencies)) if update_latencies else 0.0,
+        "avg_compute_update_latency_ms": float(np.mean(compute_update_latencies)) if compute_update_latencies else 0.0,
+        "avg_pacing_wait_ms": float(np.mean(pacing_waits)) if pacing_waits else 0.0,
         "p95_update_latency_ms": float(np.percentile(update_latencies, 95)) if update_latencies else 0.0,
         "final_macro_f1": float(metrics_rows[-1]["macro_f1"]),
         "final_micro_f1": float(metrics_rows[-1]["micro_f1"]),
         "final_link_auc": float(metrics_rows[-1]["link_auc"]),
+        "final_link_ap": float(metrics_rows[-1]["link_ap"]),
+        "final_reconstruction_auc": float(metrics_rows[-1]["reconstruction_auc"]),
+        "ablation_tag": _build_ablation_tag(args),
+        "update_rate": int(args.update_rate),
+        "effective_update_rate": float(total_events / total_update_wall_s) if total_update_wall_s > 0 else 0.0,
         "quantization_compression_ratio": float(compression_ratio),
+        "quantization_error": float(getattr(model, "quantization_error_", 0.0)),
+        "binary_compression_ratio": float(getattr(model, "binary_compression_ratio_", 1.0)),
+        "binary_error": float(getattr(model, "binary_error_", 0.0)),
         "output_dir": out_dir,
     }
     with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
@@ -890,7 +1089,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--order", type=int, default=2)
     parser.add_argument("--projection-density", type=float, default=0.12)
     parser.add_argument("--learning-rate", type=float, default=0.55)
+    parser.add_argument("--update-rate", type=int, default=0, help="目标变化速率（次/秒）；0 表示不进行速率控制")
     parser.add_argument("--quantize", action="store_true")
+    parser.add_argument("--binary-quantize", action="store_true")
+    parser.add_argument("--no-attr", action="store_true", help="消融：禁用属性融合（w/o-Attr）")
+    parser.add_argument("--no-hyperbolic", action="store_true", help="消融：禁用双曲融合，改为欧氏门控融合（w/o-Hyperbolic）")
+    parser.add_argument("--no-inc", action="store_true", help="消融：禁用增量更新，改为每快照全量重训练（w/o-Inc）")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--classifier", choices=["centroid", "logreg"], default="logreg")
     parser.add_argument("--logreg-epochs", type=int, default=260)

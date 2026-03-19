@@ -48,6 +48,11 @@ python src/edane_full_pipeline.py --mode file --dataset-preset reddit_sample --s
 
 ```bash
 python src/edane_full_pipeline.py --mode file --dataset-preset reddit_sample --snapshots 6 --classifier logreg --quantize
+python src/edane_full_pipeline.py --mode file --dataset-preset reddit_sample --snapshots 6 --classifier logreg --quantize --binary-quantize
+python src/edane_full_pipeline.py --mode file --dataset-preset reddit_sample --snapshots 6 --classifier logreg --quantize --update-rate 100
+python src/edane_full_pipeline.py --mode file --dataset-preset reddit_sample --snapshots 6 --classifier logreg --quantize --no-attr
+python src/edane_full_pipeline.py --mode file --dataset-preset reddit_sample --snapshots 6 --classifier logreg --quantize --no-hyperbolic
+python src/edane_full_pipeline.py --mode file --dataset-preset reddit_sample --snapshots 6 --classifier logreg --quantize --no-inc
 ```
 
 ### 3.3 Amazon2M 样本
@@ -93,8 +98,11 @@ run_all.bat
 | 文件 | 说明 |
 |------|------|
 | `summary.json` | 整体实验摘要 |
-| `metrics_per_snapshot.csv` | 每个快照的指标与更新时间 |
+| `metrics_per_snapshot.csv` | 每个快照的指标与更新时间（含 `link_ap`、`reconstruction_auc`） |
 | `final_embedding.npy` | 最终浮点嵌入 |
+| `final_embedding_int8.npy` | int8 量化副本 |
+| `final_embedding_scale.npy` | int8 缩放系数 |
+| `final_embedding_binary.npy` | Binary 副本（若开启 `--binary-quantize`） |
 | `metrics_curves.svg` | 自动生成的指标曲线图（可直接放论文） |
 
 ## 5. 用你自己的数据运行
@@ -128,10 +136,36 @@ python src/edane_full_pipeline.py ^
 | `--order` | 结构传播阶数 | 2 |
 | `--projection-density` | 随机投影密度 | 0.12 |
 | `--learning-rate` | 增量更新率 | 0.55 |
+| `--update-rate` | 目标变化速率（次/秒，0=不控制） | 0 |
 | `--snapshots` | 快照数 | 8 |
 | `--snapshot-mode` | `window` 或 `cumulative` | window |
 | `--max-nodes` | file 模式最大节点数（0=不限制） | 10000 |
 | `--classifier` | `logreg`（推荐）或 `centroid` | logreg |
+| `--no-attr` | 消融：禁用属性融合（w/o-Attr） | 关 |
+| `--no-hyperbolic` | 消融：禁用双曲融合（w/o-Hyperbolic） | 关 |
+| `--no-inc` | 消融：禁用增量更新（w/o-Inc） | 关 |
+
+### 6.1 阶段2/3矩阵实验（一键）
+
+```bash
+python src/run_stage23_experiments.py --mode file --dataset-preset reddit_sample --snapshots 3 --max-nodes 3000
+```
+
+输出目录示例：`outputs/stage23_matrix_reddit_sample_<timestamp>/`
+
+- `stage2_rate_results.csv`
+- `stage3_ablation_results.csv`
+- `stage23_combined_results.csv`
+
+其中：
+
+- `avg_update_latency_ms` = 端到端时延（含节流等待）
+- `avg_compute_update_latency_ms` = 纯计算时延
+- `avg_pacing_wait_ms` = 速率控制等待时延
+
+更细的模块级参数（如 `init_*`、`fusion_*`、`binary_quantize`）请参考四份模块文档；当前主流水线默认只暴露常用实验参数。
+
+当前评估输出已包含：`Macro-F1`、`Micro-F1`、`link_auc`、`link_ap`、`reconstruction_auc`。
 
 ## 7. 常见问题
 

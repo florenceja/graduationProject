@@ -1,0 +1,23 @@
+{
+  "mode": "file",
+  "num_nodes": 1000,
+  "feature_dim": 602,
+  "embedding_dim": 64,
+  "num_snapshots": 2,
+  "initialization_latency_ms": 44.38800000000054,
+  "avg_update_latency_ms": 71940.0,
+  "p95_update_latency_ms": 71940.0,
+  "final_macro_f1": 0.13892975841478025,
+  "final_micro_f1": 0.2036727879799666,
+  "final_link_auc": 0.9398880004882812,
+  "final_link_ap": 0.9318946213171209,
+  "final_reconstruction_auc": 0.9330625534057617,
+  "ablation_tag": "w/o-Inc",
+  "update_rate": 100,
+  "effective_update_rate": 100.0,
+  "quantization_compression_ratio": 7.936507936507937,
+  "quantization_error": 0.008194661465911988,
+  "binary_compression_ratio": 1.0,
+  "binary_error": 0.0,
+  "output_dir": "D:\\毕设资料\\algorithms\\outputs\\reddit_sample_20260319_173142"
+}

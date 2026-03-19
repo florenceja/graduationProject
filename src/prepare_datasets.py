@@ -19,9 +19,13 @@
 import argparse
 import csv
 import gzip
+import hashlib
 import json
 import os
-from typing import Dict, List, Tuple
+import re
+import tarfile
+from collections import Counter, defaultdict
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -41,7 +45,7 @@ def project_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def write_csv(path: str, header: List[str], rows: List[List[object]]) -> None:
+def write_csv(path: str, header: Sequence[str], rows: Sequence[Sequence[object]]) -> None:
     """统一 CSV 写入封装。"""
     with open(path, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
@@ -52,6 +56,51 @@ def write_csv(path: str, header: List[str], rows: List[List[object]]) -> None:
 def _safe_node_id(raw: object) -> str:
     """将任意节点 ID 规范化为字符串。"""
     return str(raw).strip()
+
+
+def _remove_if_exists(path: str) -> None:
+    """删除旧文件，避免过期产物残留。"""
+    if os.path.exists(path):
+        os.remove(path)
+
+
+def _text_hash_features(*texts: str, dim: int) -> np.ndarray:
+    """使用稳定哈希生成固定维度文本特征。"""
+    vec = np.zeros(dim, dtype=np.float64)
+    for text in texts:
+        for token in re.findall(r"[a-z0-9]+", text.lower()):
+            digest = hashlib.md5(token.encode("utf-8")).digest()
+            pos = int.from_bytes(digest[:4], byteorder="little", signed=False) % dim
+            vec[pos] += 1.0
+    return vec
+
+
+def _dense_row_from_selected_cols(
+    row_idx: int,
+    indptr: np.ndarray,
+    indices: np.ndarray,
+    data: np.ndarray,
+    col_to_pos: Dict[int, int],
+    width: int,
+) -> np.ndarray:
+    """从 CSR 稀疏矩阵中抽取指定列形成定长稠密向量。"""
+    row = np.zeros(width, dtype=np.float64)
+    st = int(indptr[row_idx])
+    ed = int(indptr[row_idx + 1])
+    for col, value in zip(indices[st:ed], data[st:ed]):
+        pos = col_to_pos.get(int(col))
+        if pos is not None:
+            row[pos] = float(value)
+    return row
+
+
+def _read_tar_text(tf: tarfile.TarFile, member_name: str) -> str:
+    """读取 tar.gz 中的文本文件。"""
+    member = tf.getmember(member_name)
+    extracted = tf.extractfile(member)
+    if extracted is None:
+        raise ValueError(f"无法读取压缩包成员: {member_name}")
+    return extracted.read().decode("utf-8", errors="ignore")
 
 
 def prepare_reddit_sample(max_nodes: int = 15000, seed: int = 42) -> str:
@@ -125,7 +174,9 @@ def prepare_reddit_sample(max_nodes: int = 15000, seed: int = 42) -> str:
         t = int(rng.integers(1710000000, 1715000000))
         edge_rows.append([a, b, t])
 
-    rng.shuffle(edge_rows)
+    if edge_rows:
+        order = rng.permutation(len(edge_rows))
+        edge_rows = [edge_rows[int(i)] for i in order]
 
     feature_header = ["node_id"] + [f"f{i+1}" for i in range(feat_dim)]
     write_csv(os.path.join(out_dir, "features.csv"), feature_header, feature_rows)
@@ -134,7 +185,7 @@ def prepare_reddit_sample(max_nodes: int = 15000, seed: int = 42) -> str:
 
     # 生成可控的属性更新样本，模拟动态属性漂移。
     attr_updates: List[List[object]] = []
-    label_map = {row[0]: int(row[1]) for row in label_rows}
+    label_map = {str(row[0]): int(float(str(row[1]))) for row in label_rows}
     if label_map:
         groups: Dict[int, List[str]] = {}
         for node_id, lab in label_map.items():
@@ -180,7 +231,9 @@ def prepare_amazon2m_sample(max_nodes: int = 30000, max_edges: int = 250000, see
     label_rows: List[List[object]] = []
     for i in range(num_nodes):
         node_id = f"a{i}"
-        feature_rows.append([node_id] + [float(v) for v in feat[i].tolist()])
+        row: List[object] = [node_id]
+        row.extend(float(v) for v in feat[i].tolist())
+        feature_rows.append(row)
         lab_vec = np.asarray(labels_raw[i], dtype=np.float64)
         label_rows.append([node_id, int(np.argmax(lab_vec))])
 
@@ -206,7 +259,9 @@ def prepare_amazon2m_sample(max_nodes: int = 30000, max_edges: int = 250000, see
         if len(edge_rows) >= max_edges:
             break
 
-    rng.shuffle(edge_rows)
+    if edge_rows:
+        order = rng.permutation(len(edge_rows))
+        edge_rows = [edge_rows[int(i)] for i in order]
     feature_header = ["node_id"] + [f"f{i+1}" for i in range(feature_dim)]
     write_csv(os.path.join(out_dir, "features.csv"), feature_header, feature_rows)
     write_csv(os.path.join(out_dir, "labels.csv"), ["node_id", "label"], label_rows)
@@ -220,7 +275,7 @@ def prepare_mag_sample(max_nodes: int = 8000, max_edges: int = 200000, seed: int
     说明：
     - 原始 MAG 文件非常大（10M+ 节点），直接用全量会超出普通实验机容量。
     - 这里抽取前 max_nodes 个节点，并限制最多 max_edges 条边。
-    - 为避免加载超大 attr_matrix，特征使用结构统计特征（度、对数度等）构造。
+    - 特征优先来自原始 attr_matrix 在采样子图上的高频属性列，避免退化成纯结构代理特征。
     """
     rng = np.random.default_rng(seed)
     src = os.path.join(source_root(), "MAG-", "mag_scholar_c.npz")
@@ -293,50 +348,67 @@ def prepare_mag_sample(max_nodes: int = 8000, max_edges: int = 200000, seed: int
             seen.add(key)
             degree[a] += 1
             degree[b] += 1
-            t = int(rng.integers(1710000000, 1715000000))
-            edge_rows.append([f"m{a}", f"m{b}", t])
+            edge_rows.append([f"m{a}", f"m{b}"])
             if len(edge_rows) >= max_edges:
                 break
         if len(edge_rows) >= max_edges:
             break
 
-    rng.shuffle(edge_rows)
+    if edge_rows:
+        order = rng.permutation(len(edge_rows))
+        edge_rows = [edge_rows[int(i)] for i in order]
 
-    # 使用结构统计构建轻量特征，避免读取超大 attr_matrix。
-    deg_max = max(int(degree.max()), 1)
+    selected_attr_cols: List[int] = []
+    col_to_pos: Dict[int, int] = {}
+    attr_indptr: Optional[np.ndarray] = None
+    attr_indices: Optional[np.ndarray] = None
+    attr_data: Optional[np.ndarray] = None
+    try:
+        attr_indptr = npz["attr_matrix.indptr"]
+        attr_indices = npz["attr_matrix.indices"]
+        attr_data = npz["attr_matrix.data"]
+        assert attr_indptr is not None
+        assert attr_indices is not None
+        attr_counter: Counter[int] = Counter()
+        for old_i in selected_old:
+            st = int(attr_indptr[old_i])
+            ed = int(attr_indptr[old_i + 1])
+            attr_counter.update(int(col) for col in attr_indices[st:ed])
+        selected_attr_cols = [col for col, _ in attr_counter.most_common(64)]
+        col_to_pos = {col: pos for pos, col in enumerate(selected_attr_cols)}
+    except MemoryError:
+        selected_attr_cols = []
     feature_rows: List[List[object]] = []
-    for i in range(num_nodes):
-        d = float(degree[i])
-        feature_rows.append(
-            [
-                f"m{i}",
-                d,
-                np.log1p(d),
-                d / deg_max,
-                float(rng.normal(0.0, 0.1)),
-                float(rng.normal(0.0, 0.1)),
-            ]
-        )
-    feature_header = ["node_id", "f1", "f2", "f3", "f4", "f5"]
+    if selected_attr_cols and attr_indptr is not None and attr_indices is not None and attr_data is not None:
+        width = len(selected_attr_cols)
+        local_attr_indptr = attr_indptr
+        local_attr_indices = attr_indices
+        local_attr_data = attr_data
+        for i, old_i in enumerate(selected_old):
+            row = _dense_row_from_selected_cols(
+                old_i,
+                local_attr_indptr,
+                local_attr_indices,
+                local_attr_data,
+                col_to_pos,
+                width,
+            )
+            feature_row: List[object] = [f"m{i}"]
+            feature_row.extend(float(v) for v in row.tolist())
+            feature_rows.append(feature_row)
+        feature_header = ["node_id"] + [f"f{i+1}" for i in range(width)]
+    else:
+        deg_max = max(int(degree.max()), 1)
+        for i in range(num_nodes):
+            d = float(degree[i])
+            feature_rows.append([f"m{i}", d, np.log1p(d), d / deg_max])
+        feature_header = ["node_id", "f1", "f2", "f3"]
 
     label_rows = [[f"m{i}", int(labels[selected_old[i]])] for i in range(num_nodes)]
     write_csv(os.path.join(out_dir, "features.csv"), feature_header, feature_rows)
     write_csv(os.path.join(out_dir, "labels.csv"), ["node_id", "label"], label_rows)
-    write_csv(os.path.join(out_dir, "edges.csv"), ["src", "dst", "time"], edge_rows)
-
-    # 生成一份轻量属性更新。
-    attr_updates: List[List[object]] = []
-    for _ in range(min(2500, num_nodes * 2)):
-        idx = int(rng.integers(0, num_nodes))
-        base = np.asarray(feature_rows[idx][1:], dtype=np.float64)
-        new_vec = base + rng.normal(0.0, 0.02, size=5)
-        t = int(rng.integers(1710000000, 1715000000))
-        attr_updates.append([t, f"m{idx}"] + [float(v) for v in new_vec.tolist()])
-    write_csv(
-        os.path.join(out_dir, "attr_updates.csv"),
-        ["time", "node_id", "f1", "f2", "f3", "f4", "f5"],
-        attr_updates,
-    )
+    write_csv(os.path.join(out_dir, "edges.csv"), ["src", "dst"], edge_rows)
+    _remove_if_exists(os.path.join(out_dir, "attr_updates.csv"))
     return out_dir
 
 
@@ -344,104 +416,134 @@ def prepare_twitter_sample(max_nodes: int = 12000, max_edges: int = 180000, seed
     """从 twitter_sampled/twitter_combined.txt.gz 构建样本集。
 
     说明：
-    - 原始 twitter_full 非常大，优先使用 twitter_sampled 中的 combined 边文件。
-    - 数据本身无标准标签和属性，这里构造结构统计特征与伪标签（度分桶）。
+    - 优先使用 twitter_sampled/twitter.tar.gz 中的 ego-network 原始属性与圈层文件。
+    - 输出静态属性图，不再伪造时间戳和属性更新。
     """
-    rng = np.random.default_rng(seed)
-    src = os.path.join(source_root(), "twitter", "twitter_sampled", "twitter_combined.txt.gz")
+    src = os.path.join(source_root(), "twitter", "twitter_sampled", "twitter.tar.gz")
     out_dir = os.path.join(project_root(), "data", "twitter_sample")
     ensure_dir(out_dir)
 
-    selected_nodes: Dict[str, int] = {}
-    edge_rows: List[List[object]] = []
-    seen = set()
+    with tarfile.open(src, "r:gz") as tf:
+        member_names = tf.getnames()
+        stems: Dict[str, set] = defaultdict(set)
+        for name in member_names:
+            if not name.startswith("twitter/") or name.count(".") == 0:
+                continue
+            stem, ext = name.rsplit(".", 1)
+            stems[stem].add(ext)
 
-    with gzip.open(src, "rt", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            parts = line.strip().split()
-            if len(parts) < 2:
-                continue
-            u = _safe_node_id(parts[0])
-            v = _safe_node_id(parts[1])
-            if u == "" or v == "" or u == v:
+        required = {"feat", "egofeat", "circles", "edges", "featnames"}
+        ego_stems = sorted(stem for stem, exts in stems.items() if required.issubset(exts))
+
+        node_feature_names: Dict[str, set] = defaultdict(set)
+        node_primary_circle: Dict[str, str] = {}
+        edge_set: set[Tuple[str, str]] = set()
+        node_order: Dict[str, int] = {}
+
+        for stem in ego_stems:
+            ego_id = stem.rsplit("/", 1)[-1]
+            featnames_text = _read_tar_text(tf, f"{stem}.featnames")
+            feat_names: List[str] = []
+            for line in featnames_text.splitlines():
+                parts = line.strip().split(maxsplit=1)
+                if len(parts) == 2:
+                    feat_names.append(parts[1].strip())
+            if not feat_names:
                 continue
 
-            # 控制节点规模：若超限则跳过引入新节点的边。
-            new_nodes = []
-            if u not in selected_nodes:
-                new_nodes.append(u)
-            if v not in selected_nodes:
-                new_nodes.append(v)
-            if len(selected_nodes) + len(new_nodes) > max_nodes:
-                continue
-            for node in new_nodes:
-                selected_nodes[node] = len(selected_nodes)
+            feat_text = _read_tar_text(tf, f"{stem}.feat")
+            egofeat_text = _read_tar_text(tf, f"{stem}.egofeat")
+            circles_text = _read_tar_text(tf, f"{stem}.circles")
+            edges_text = _read_tar_text(tf, f"{stem}.edges")
 
-            a, b = (u, v) if u < v else (v, u)
-            key = (a, b)
-            if key in seen:
-                continue
-            seen.add(key)
-            t = int(rng.integers(1710000000, 1715000000))
-            edge_rows.append([a, b, t])
-            if len(edge_rows) >= max_edges:
+            local_nodes: List[str] = []
+
+            ego_bits = [int(v) for v in egofeat_text.strip().split() if v != ""]
+            if len(ego_bits) == len(feat_names):
+                ego_attrs = {feat_names[i] for i, bit in enumerate(ego_bits) if bit != 0}
+                node_feature_names[ego_id].update(ego_attrs)
+            if ego_id not in node_order and len(node_order) < max_nodes:
+                node_order[ego_id] = len(node_order)
+            local_nodes.append(ego_id)
+
+            for line in feat_text.splitlines():
+                parts = line.strip().split()
+                if len(parts) != len(feat_names) + 1:
+                    continue
+                node_id = _safe_node_id(parts[0])
+                if node_id not in node_order and len(node_order) >= max_nodes:
+                    continue
+                if node_id not in node_order:
+                    node_order[node_id] = len(node_order)
+                attrs = {feat_names[i] for i, bit in enumerate(parts[1:]) if bit == "1"}
+                node_feature_names[node_id].update(attrs)
+                local_nodes.append(node_id)
+
+            local_node_set = set(local_nodes)
+            for line in circles_text.splitlines():
+                parts = line.strip().split()
+                if len(parts) < 2:
+                    continue
+                circle_name = f"{ego_id}:{parts[0]}"
+                for node_id in parts[1:]:
+                    node_id = _safe_node_id(node_id)
+                    if node_id in local_node_set and node_id not in node_primary_circle:
+                        node_primary_circle[node_id] = circle_name
+
+            for node_id in local_node_set:
+                if node_id == ego_id:
+                    continue
+                a, b = (ego_id, node_id) if ego_id < node_id else (node_id, ego_id)
+                edge_set.add((a, b))
+
+            for line in edges_text.splitlines():
+                parts = line.strip().split()
+                if len(parts) < 2:
+                    continue
+                u = _safe_node_id(parts[0])
+                v = _safe_node_id(parts[1])
+                if u not in local_node_set or v not in local_node_set or u == v:
+                    continue
+                a, b = (u, v) if u < v else (v, u)
+                edge_set.add((a, b))
+
+            if len(node_order) >= max_nodes and len(edge_set) >= max_edges:
                 break
 
-    node_list = sorted(selected_nodes.keys(), key=lambda x: selected_nodes[x])
-    node_to_idx = {n: i for i, n in enumerate(node_list)}
-    degree = np.zeros(len(node_list), dtype=np.int64)
-    for s, d, _ in edge_rows:
-        i = node_to_idx[s]
-        j = node_to_idx[d]
-        degree[i] += 1
-        degree[j] += 1
+        selected_node_ids = [node for node, _ in sorted(node_order.items(), key=lambda item: item[1])]
+        selected_set = set(selected_node_ids)
+        edge_rows = [[u, v] for u, v in edge_set if u in selected_set and v in selected_set][:max_edges]
 
-    deg_max = max(int(degree.max()), 1)
-    feature_rows: List[List[object]] = []
-    for node in node_list:
-        i = node_to_idx[node]
-        d = float(degree[i])
-        feature_rows.append(
-            [
-                node,
-                d,
-                np.log1p(d),
-                d / deg_max,
-                float(rng.normal(0.0, 0.1)),
-                float(rng.normal(0.0, 0.1)),
-            ]
-        )
-    feature_header = ["node_id", "f1", "f2", "f3", "f4", "f5"]
+        feature_counter: Counter[str] = Counter()
+        for node_id in selected_node_ids:
+            feature_counter.update(node_feature_names.get(node_id, set()))
+        selected_features = [name for name, _ in feature_counter.most_common(128)]
+        feature_to_pos = {name: idx for idx, name in enumerate(selected_features)}
 
-    # 伪标签：按度分位数分 5 档，便于分类评估链路跑通。
-    if len(node_list) > 0:
-        quantiles = np.quantile(degree.astype(np.float64), [0.2, 0.4, 0.6, 0.8])
-    else:
-        quantiles = np.array([0, 0, 0, 0], dtype=np.float64)
-    label_rows: List[List[object]] = []
-    for node in node_list:
-        d = float(degree[node_to_idx[node]])
-        label = int(np.sum(d > quantiles))
-        label_rows.append([node, label])
+        feature_rows: List[List[object]] = []
+        for node_id in selected_node_ids:
+            row = np.zeros(len(selected_features), dtype=np.float64)
+            for feat_name in node_feature_names.get(node_id, set()):
+                pos = feature_to_pos.get(feat_name)
+                if pos is not None:
+                    row[pos] = 1.0
+            feature_row: List[object] = [node_id]
+            feature_row.extend(float(v) for v in row.tolist())
+            feature_rows.append(feature_row)
 
+        label_names = sorted({name for node, name in node_primary_circle.items() if node in selected_set})
+        label_to_idx = {name: idx for idx, name in enumerate(label_names)}
+        label_rows = [
+            [node_id, label_to_idx[node_primary_circle[node_id]]]
+            for node_id in selected_node_ids
+            if node_id in node_primary_circle
+        ]
+
+    feature_header = ["node_id"] + [f"f{i+1}" for i in range(len(selected_features))]
     write_csv(os.path.join(out_dir, "features.csv"), feature_header, feature_rows)
     write_csv(os.path.join(out_dir, "labels.csv"), ["node_id", "label"], label_rows)
-    write_csv(os.path.join(out_dir, "edges.csv"), ["src", "dst", "time"], edge_rows)
-
-    # 生成属性更新，模拟节点行为漂移。
-    attr_updates: List[List[object]] = []
-    for _ in range(min(3000, len(node_list) * 2)):
-        idx = int(rng.integers(0, len(node_list)))
-        node = node_list[idx]
-        base = np.asarray(feature_rows[idx][1:], dtype=np.float64)
-        new_vec = base + rng.normal(0.0, 0.03, size=5)
-        t = int(rng.integers(1710000000, 1715000000))
-        attr_updates.append([t, node] + [float(v) for v in new_vec.tolist()])
-    write_csv(
-        os.path.join(out_dir, "attr_updates.csv"),
-        ["time", "node_id", "f1", "f2", "f3", "f4", "f5"],
-        attr_updates,
-    )
+    write_csv(os.path.join(out_dir, "edges.csv"), ["src", "dst"], edge_rows)
+    _remove_if_exists(os.path.join(out_dir, "attr_updates.csv"))
     return out_dir
 
 
@@ -454,8 +556,8 @@ def prepare_amazon3m_sample(
     及其关联的标签索引列表。这里通过共享标签（co-label）关系构建商品图：
     若两个商品共享 >= 2 个相同的 target_ind，则建一条边。
 
-    特征采用文本统计量（标题词数、内容词数、内容字符数、关联标签数）加随机哈希
-    特征，不依赖外部 NLP 库。标签取商品最频繁出现的 target_ind 再分桶。
+    特征采用文本统计量 + 稳定哈希词袋，不依赖外部 NLP 库。
+    标签使用每个商品 target_rel 最强的原始 target_ind，再重映射为连续整数。
     """
     rng = np.random.default_rng(seed)
     src_dir = os.path.join(source_root(), "Amazon-3M.raw")
@@ -484,7 +586,6 @@ def prepare_amazon3m_sample(
         products = [products[i] for i in idx_sel]
 
     num_nodes = len(products)
-    uid_to_idx = {p["uid"]: i for i, p in enumerate(products)}
     node_ids = [p["uid"] for p in products]
 
     label_to_products: Dict[int, List[int]] = {}
@@ -517,11 +618,12 @@ def prepare_amazon3m_sample(
     edge_rows: List[List[object]] = []
     degree = np.zeros(num_nodes, dtype=np.int64)
     for u, v in edge_set:
-        t = int(rng.integers(1710000000, 1715000000))
-        edge_rows.append([node_ids[u], node_ids[v], t])
+        edge_rows.append([node_ids[u], node_ids[v]])
         degree[u] += 1
         degree[v] += 1
-    rng.shuffle(edge_rows)
+    if edge_rows:
+        order = rng.permutation(len(edge_rows))
+        edge_rows = [edge_rows[int(i)] for i in order]
 
     feature_rows: List[List[object]] = []
     for i, p in enumerate(products):
@@ -532,9 +634,11 @@ def prepare_amazon3m_sample(
         content_chars = len(content)
         num_targets = len(p.get("target_ind", []))
         d = float(degree[i])
-        h1 = float((hash(title) % 10000) / 10000.0)
-        h2 = float((hash(content[:50]) % 10000) / 10000.0)
-        feature_rows.append([
+        rel_values = [float(v) for v in p.get("target_rel", [])]
+        rel_mean = float(np.mean(rel_values)) if rel_values else 0.0
+        rel_max = float(np.max(rel_values)) if rel_values else 0.0
+        text_hash = _text_hash_features(title, content, dim=16)
+        row: List[object] = [
             node_ids[i],
             float(title_words),
             float(content_words),
@@ -542,48 +646,40 @@ def prepare_amazon3m_sample(
             float(num_targets),
             d,
             np.log1p(d),
-            h1,
-            h2,
-        ])
-    feature_header = ["node_id", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8"]
+            rel_mean,
+            rel_max,
+        ]
+        row.extend(float(v) for v in text_hash.tolist())
+        feature_rows.append(row)
+    feature_header = ["node_id", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8"] + [
+        f"f{i+9}" for i in range(16)
+    ]
 
-    all_tids: List[int] = []
+    raw_best_labels: List[int] = []
     for p in products:
-        all_tids.extend(p.get("target_ind", []))
-    from collections import Counter
-    tid_counts = Counter(all_tids)
-    top_labels = [tid for tid, _ in tid_counts.most_common(20)]
-    top_set = set(top_labels)
-    top_to_cls = {tid: ci for ci, tid in enumerate(top_labels)}
+        tids = [int(v) for v in p.get("target_ind", [])]
+        rels = [float(v) for v in p.get("target_rel", [])]
+        if not tids:
+            raw_best_labels.append(-1)
+            continue
+        if len(rels) == len(tids) and rels:
+            best_idx = int(np.argmax(np.asarray(rels, dtype=np.float64)))
+        else:
+            best_idx = 0
+        raw_best_labels.append(tids[best_idx])
+
+    valid_raw_labels = sorted({lab for lab in raw_best_labels if lab >= 0})
+    label_to_dense = {lab: idx for idx, lab in enumerate(valid_raw_labels)}
 
     label_rows: List[List[object]] = []
-    for i, p in enumerate(products):
-        tids = p.get("target_ind", [])
-        best = -1
-        for tid in tids:
-            if tid in top_set:
-                best = top_to_cls[tid]
-                break
-        if best < 0:
-            best = len(top_labels)
-        label_rows.append([node_ids[i], best])
+    for node_id, raw_label in zip(node_ids, raw_best_labels):
+        dense_label = label_to_dense.get(raw_label, -1)
+        label_rows.append([node_id, dense_label])
 
     write_csv(os.path.join(out_dir, "features.csv"), feature_header, feature_rows)
     write_csv(os.path.join(out_dir, "labels.csv"), ["node_id", "label"], label_rows)
-    write_csv(os.path.join(out_dir, "edges.csv"), ["src", "dst", "time"], edge_rows)
-
-    attr_updates: List[List[object]] = []
-    for _ in range(min(3000, num_nodes * 2)):
-        idx = int(rng.integers(0, num_nodes))
-        base = np.asarray(feature_rows[idx][1:], dtype=np.float64)
-        new_vec = base + rng.normal(0.0, 0.03, size=len(base))
-        t = int(rng.integers(1710000000, 1715000000))
-        attr_updates.append([t, node_ids[idx]] + [float(v) for v in new_vec.tolist()])
-    write_csv(
-        os.path.join(out_dir, "attr_updates.csv"),
-        ["time", "node_id"] + feature_header[1:],
-        attr_updates,
-    )
+    write_csv(os.path.join(out_dir, "edges.csv"), ["src", "dst"], edge_rows)
+    _remove_if_exists(os.path.join(out_dir, "attr_updates.csv"))
 
     print(f"  amazon3m_sample: {num_nodes} nodes, {len(edge_set)} edges")
     return out_dir

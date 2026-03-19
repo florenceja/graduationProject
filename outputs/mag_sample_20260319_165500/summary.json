@@ -1,0 +1,20 @@
+{
+  "mode": "file",
+  "num_nodes": 8000,
+  "feature_dim": 3,
+  "embedding_dim": 32,
+  "num_snapshots": 3,
+  "initialization_latency_ms": 192.89819999999997,
+  "avg_update_latency_ms": 135.67195000000004,
+  "p95_update_latency_ms": 137.13125500000012,
+  "final_macro_f1": 0.06809186530813939,
+  "final_micro_f1": 0.36583333333333334,
+  "final_link_auc": 0.7168426513671875,
+  "final_link_ap": 0.7667370622720994,
+  "final_reconstruction_auc": 0.705265998840332,
+  "quantization_compression_ratio": 7.992007992007992,
+  "quantization_error": 0.009845966254260317,
+  "binary_compression_ratio": 2.0,
+  "binary_error": 4.922065767790115,
+  "output_dir": "D:\\毕设资料\\algorithms\\outputs\\mag_sample_20260319_165500"
+}

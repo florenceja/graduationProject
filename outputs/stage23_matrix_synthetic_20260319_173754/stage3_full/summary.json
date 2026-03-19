@@ -1,0 +1,23 @@
+{
+  "mode": "synthetic",
+  "num_nodes": 240,
+  "feature_dim": 16,
+  "embedding_dim": 32,
+  "num_snapshots": 5,
+  "initialization_latency_ms": 15.011900000000022,
+  "avg_update_latency_ms": 1.8848249999999926,
+  "p95_update_latency_ms": 2.2332349999999943,
+  "final_macro_f1": 1.0,
+  "final_micro_f1": 1.0,
+  "final_link_auc": 0.7863655090332031,
+  "final_link_ap": 0.8249813350222457,
+  "final_reconstruction_auc": 0.7938480377197266,
+  "ablation_tag": "full",
+  "update_rate": 0,
+  "effective_update_rate": 2652.766171925786,
+  "quantization_compression_ratio": 7.741935483870968,
+  "quantization_error": 0.0058322913956669,
+  "binary_compression_ratio": 1.0,
+  "binary_error": 0.0,
+  "output_dir": "D:\\毕设资料\\algorithms\\outputs\\stage23_matrix_synthetic_20260319_173754\\stage3_full"
+}

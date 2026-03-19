@@ -1,0 +1,20 @@
+{
+  "mode": "file",
+  "num_nodes": 10000,
+  "feature_dim": 100,
+  "embedding_dim": 64,
+  "num_snapshots": 3,
+  "initialization_latency_ms": 651.3741,
+  "avg_update_latency_ms": 539.2524500000002,
+  "p95_update_latency_ms": 549.7554050000001,
+  "final_macro_f1": 1.0,
+  "final_micro_f1": 1.0,
+  "final_link_auc": 0.9160919189453125,
+  "final_link_ap": 0.9349368107774354,
+  "final_reconstruction_auc": 0.91754150390625,
+  "quantization_compression_ratio": 7.9936051159072745,
+  "quantization_error": 0.009461645246216257,
+  "binary_compression_ratio": 2.0,
+  "binary_error": 7.236954098839451,
+  "output_dir": "D:\\毕设资料\\algorithms\\outputs\\amazon2m_sample_20260319_165430"
+}
