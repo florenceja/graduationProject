@@ -23,6 +23,12 @@
 
 每个目录包含：`edges.csv`、`features.csv`、`labels.csv`，以及可选的 `attr_updates.csv`。
 
+补充说明：
+
+- 上表中的 `data/<preset>/` 是**标准化后的实验输入目录**；
+- 这些目录通常由 `src/prepare_datasets.py` 从项目内 `dataset/` 原始数据生成；
+- 当前 `prepare_datasets.py` 默认按项目根目录下的 `dataset/` 作为原始数据目录。
+
 ## 3. 支持的两种模式
 
 ### 3.1 合成数据模式（快速验证）
@@ -31,9 +37,21 @@
 python src/edane_full_pipeline.py --mode synthetic --quantize
 ```
 
+如需启用 PyTorch dense 后端：
+
+```bash
+python src/edane_full_pipeline.py --mode synthetic --quantize --backend torch
+```
+
 ### 3.2 文件数据模式（真实实验）
 
 #### 方式 A：使用预设数据目录（推荐）
+
+第一次验证整条链路时，建议先用较小规模命令检查数据、预处理和主流水线是否都能跑通，例如：
+
+```bash
+python src/edane_full_pipeline.py --mode file --dataset-preset reddit_sample --snapshots 3 --max-nodes 3000 --quantize
+```
 
 ```bash
 python src/edane_full_pipeline.py --mode file --dataset-preset reddit_sample --snapshots 6 --quantize
@@ -79,6 +97,12 @@ python src/edane_full_pipeline.py ^
 ```
 
 ## 4. 从原始数据重新生成样本
+
+当前推荐做法：
+
+1. 把原始数据放在项目根目录下的 `dataset/`
+2. 运行 `prepare_datasets.py` 生成 `data/<preset>/`
+3. 再通过 `--dataset-preset` 运行主流水线
 
 ```bash
 python src/prepare_datasets.py --prepare-reddit --prepare-amazon --prepare-amazon3m --prepare-mag --prepare-twitter
@@ -139,6 +163,8 @@ time,node_id,f1,f2,f3
 
 每次运行会在 `outputs/<数据集名>_<时间戳>/` 下生成（如 `reddit_sample_20260316_170012/`）：
 
+说明：`outputs/` 是本地实验产物目录，当前仓库默认按本地生成内容管理，不建议直接作为远程仓库正文提交。
+
 | 文件 | 说明 |
 |------|------|
 | `summary.json` | 整体实验摘要（时延、F1、AUC/AP、重构AUC、压缩比/误差） |
@@ -164,6 +190,7 @@ time,node_id,f1,f2,f3
 | `--max-nodes` | file 模式最大节点数（0=不限制） | 10000 |
 | `--dataset-preset` | 数据预设名（见上方表格） | — |
 | `--classifier` | `logreg` 或 `centroid` | logreg |
+| `--backend` | `numpy` 或 `torch`；`torch` 仅用于 dense 计算 | numpy |
 | `--logreg-epochs` | 逻辑回归训练轮次 | 260 |
 | `--logreg-lr` | 逻辑回归学习率 | 0.35 |
 | `--logreg-weight-decay` | 逻辑回归权重衰减 | 1e-4 |
@@ -176,8 +203,10 @@ time,node_id,f1,f2,f3
 
 ## 8. 补充说明
 
-- 当前实现已切换为 CSR 稀疏邻接后端（依赖 SciPy），可显著降低大图内存占用。安装：`pip install scipy`。
+- 当前实现已切换为 CSR 稀疏邻接后端（依赖 SciPy），可显著降低大图内存占用。默认安装：`pip install -r requirements.txt`。
+- 若指定 `--backend torch`，则仅 dense 计算切换到 PyTorch；`scipy.sparse` 图操作仍保留。PyTorch 需单独安装。
 - 该代码是"从数据预处理到实验评估"的系统化研究原型，适合毕业设计实验与论文撰写。
+- 当前模块二在代码层面采用的是**局部一跳增量更新的工程化近似实现**，不是严格矩阵谱扰动闭式更新；做论文或文档表述时建议保持这一口径。
 - `MAG-` 原始数据体量极大，`mag_sample` 使用了节点/边抽样；在内存允许时优先尝试真实属性列，否则回退到轻量结构特征。
 - `twitter_sample` 当前优先使用 `twitter_sampled/twitter.tar.gz` 中的 `.feat/.egofeat/.featnames/.circles/.edges` 构造真实属性图与圈层标签，不再使用早期的度分桶伪标签方案。
 - `amazon3m_sample` 通过共享标签（co-label）关系构建商品图，特征使用文本统计量 + 稳定哈希词袋，标签使用 `target_rel` 最强对应的 `target_ind`。

@@ -36,7 +36,14 @@ def ensure_dir(path: str) -> None:
 
 
 def source_root() -> str:
-    """原始数据集根目录。"""
+    """原始数据集根目录。
+
+    优先使用当前项目下的 dataset/ 目录，便于仓库内自包含管理；
+    若项目内不存在该目录，则回退到历史外部路径，保持兼容性。
+    """
+    project_dataset = os.path.join(project_root(), "dataset")
+    if os.path.isdir(project_dataset):
+        return project_dataset
     return "D:/" + "".join(map(chr, [0x6bd5, 0x8bbe, 0x8d44, 0x6599])) + "/dataset"
 
 

@@ -12,7 +12,7 @@
 
 适用于毕业设计、课程实验和方法验证，不是工业级分布式实现。
 
-**Python 依赖**：NumPy ≥ 1.22、SciPy ≥ 1.7（`pip install numpy scipy`）。
+**Python 依赖**：默认运行依赖为 NumPy ≥ 1.22、SciPy ≥ 1.7（`pip install numpy scipy`）；PyTorch 为可选增强后端，仅在 `backend="torch"` 时需要单独安装。
 
 ## 2. 目录结构
 
@@ -25,15 +25,16 @@ algorithms/
 ├── docs/                         # 文档
 │   ├── algorithm.md              # 算法理论说明
 │   ├── development.md            # 开发指南（本文件）
+│   ├── evaluation_metrics_design_usage.md  # 评估指标说明
 │   ├── getting_started.md        # 快速上手
-│   ├── pipeline_usage.md         # 流水线详细用法
-│   └── thesis_evaluation_conclusion_auto.md  # 论文结论（自动生成）
+│   ├── modules_1_4_integrated.md # 模块一至模块四整合文档
+│   └── pipeline_usage.md         # 流水线详细用法
+├── dataset/                      # 项目内原始数据目录（本地使用，prepare_datasets.py 优先读取）
 ├── src/                          # 源代码
 │   ├── edane.py                  # 算法核心（模型定义、训练、增量更新、量化）
 │   ├── edane_full_pipeline.py    # 端到端实验流水线
 │   ├── prepare_datasets.py       # 原始数据集 → 统一 CSV 格式
 │   ├── plot_metrics_svg.py       # 从 CSV 生成 SVG 曲线图
-│   ├── generate_thesis_conclusion.py  # 论文结论自动生成
 │   ├── run_edane_experiment.py   # 轻量快速验证脚本
 │   └── run_stage23_experiments.py # 阶段2/3矩阵实验一键脚本
 ├── data/                         # 预处理后的数据集
@@ -42,8 +43,13 @@ algorithms/
 │   ├── amazon3m_sample/
 │   ├── mag_sample/
 │   └── twitter_sample/
-└── outputs/                      # 实验输出（按时间戳分目录）
+└── outputs/                      # 实验输出（按时间戳分目录，本地生成，默认不提交）
 ```
+
+补充说明：
+
+- `prepare_datasets.py` 当前按项目根目录下的 `dataset/` 作为默认原始数据目录。
+- 当前仓库本地开发约定中，`dataset/` 与 `outputs/` 都按**本地数据/本地实验产物**对待，不建议直接纳入远程仓库版本管理。
 
 ## 3. 核心流程（代码视角）
 
@@ -57,11 +63,12 @@ algorithms/
    - 属性嵌入计算：`H_x = X W_x`
    - 可学习双曲门控融合
    - int8 / 可选 binary 压缩
+   - `backend="torch"` 时，仅 dense 数值计算走 PyTorch；稀疏图操作仍走 SciPy
 
 2. `apply_updates(...)`
    - 支持节点增删、边增删和属性变更
    - 自动扩展受影响节点到一跳邻居
-   - 按文档主公式更新结构嵌入
+   - 基于已有嵌入做局部近似结构更新（工程化实现，不是严格谱扰动闭式解）
    - 局部重算属性嵌入与融合向量
 
 ### 3.2 管线层（`src/edane_full_pipeline.py`）
@@ -74,6 +81,18 @@ algorithms/
 6. 自动导出 `metrics_curves.svg` 曲线图
 
 ## 4. 数据约定
+
+### 4.0 原始数据与实验输入的关系
+
+- `dataset/`：存放原始数据或原始压缩包，供 `prepare_datasets.py` 读取；
+- `data/<preset>/`：存放转换后的统一 CSV 四件套，是 `edane_full_pipeline.py` 文件模式直接消费的标准输入。
+
+也就是说，当前推荐流程是：
+
+1. 把原始数据放在项目内 `dataset/`
+2. 运行 `python src/prepare_datasets.py ...`
+3. 让脚本生成 `data/reddit_sample/`、`data/amazon2m_sample/` 等标准化目录
+4. 再用 `edane_full_pipeline.py --dataset-preset <preset>` 跑实验
 
 ### 4.1 输入文件（文件模式）
 
@@ -119,7 +138,7 @@ algorithms/
 ### 6.1 新增数据集适配
 
 1. 在 `src/prepare_datasets.py` 新增 `prepare_xxx_sample()`
-2. 输出统一 CSV 四件套（至少 edges / features / labels）
+2. 从项目内 `dataset/` 读取原始数据，并输出统一 CSV 四件套（至少 edges / features / labels）
 3. 通过 `--dataset-preset` 接入管线
 
 当前已内置预设：`reddit_sample`、`amazon2m_sample`、`amazon3m_sample`、`mag_sample`、`twitter_sample`
@@ -140,6 +159,7 @@ algorithms/
 - 初始化模块：`structure_weights`、`init_iterations`、`init_step_size`、`init_reg`、`init_tol`
 - 融合模块：`fusion_train_steps`、`fusion_lr`、`fusion_weight_decay`
 - 存储模块：`binary_quantize`
+- 后端模块：`backend`（`numpy` / `torch`，其中 `torch` 仅切换 dense 计算路径）
 
 主流水线默认只暴露常用参数；更细控制可直接通过 Python API 实验，或继续扩展 CLI。
 
@@ -170,7 +190,12 @@ python src/run_stage23_experiments.py --mode file --dataset-preset reddit_sample
 
 - **报错：找不到数据预设目录**
   - 检查 `data/<preset>/` 是否存在
-  - 先运行 `python src/prepare_datasets.py`
+  - 先确认项目根目录下 `dataset/` 是否存在原始数据
+  - 再运行 `python src/prepare_datasets.py`
+
+- **报错：原始数据路径不对**
+  - 当前 `prepare_datasets.py` 默认读取 `<project_root>/dataset`
+  - 若你调整了目录结构，优先检查项目内 `dataset/README.md` 和 `prepare_datasets.py` 中对应的数据读取路径
 
 - **报错：属性更新维度不一致**
   - `attr_updates.csv` 的特征列数必须与 `features.csv` 一致
@@ -188,3 +213,13 @@ python src/run_stage23_experiments.py --mode file --dataset-preset reddit_sample
 - 将批处理改为 mini-batch / 分块 out-of-core
 - 增加多进程或分布式执行
 - 增加实验配置文件（YAML）与统一日志系统
+
+## 9. 当前实现边界（开发时应保持一致）
+
+为避免文档与代码再次偏离，建议开发时统一使用以下表述口径：
+
+- 模块一：当前实现是**稀疏随机投影锚点 + 显式目标优化初始化**；
+- 模块二：当前实现是**局部一跳增量更新的工程化近似版本**，不是严格矩阵谱扰动闭式解；
+- 模块三：当前实现是**轻量双曲门控融合**，不是重型多头注意力网络；
+- 模块四：当前实现以**逐维对称 int8 量化**为主，binary 副本偏实验性质；
+- 整个项目当前是**研究原型 / 可运行实验系统**，不是工业级分布式生产实现。

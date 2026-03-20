@@ -12,16 +12,40 @@
 """
 
 import math
+import importlib
+from importlib.util import find_spec
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterable, List, Literal, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from scipy import sparse
+
+_TORCH_AVAILABLE = find_spec("torch") is not None
 
 
 ArrayLike = np.ndarray
 SparseMatrix = sparse.csr_matrix
 AdjLike = Union[np.ndarray, SparseMatrix]
+BackendName = Literal["numpy", "torch"]
+
+
+def _is_torch_tensor(value: object) -> bool:
+    if not _TORCH_AVAILABLE:
+        return False
+    torch_module = importlib.import_module("torch")
+    return isinstance(value, torch_module.Tensor)
+
+
+def _to_numpy(value: object) -> np.ndarray:
+    if _is_torch_tensor(value):
+        detach = getattr(value, "detach", None)
+        if not callable(detach):
+            raise TypeError("Expected a torch.Tensor-like object with detach().")
+        tensor = detach()
+        cpu_tensor = getattr(tensor, "cpu")()
+        numpy_array = getattr(cpu_tensor, "numpy")()
+        return np.asarray(numpy_array, dtype=np.float64)
+    return np.asarray(value, dtype=np.float64)
 
 
 def _sigmoid(x: ArrayLike) -> ArrayLike:
@@ -195,6 +219,9 @@ class EDANE:
         fusion_weight_decay: float = 1e-4,
         use_attr_fusion: bool = True,
         use_hyperbolic_fusion: bool = True,
+        backend: BackendName = "numpy",
+        torch_dtype: str = "float64",
+        torch_device: str = "cpu",
     ) -> None:
         self.dim = dim
         self.order = order
@@ -213,6 +240,13 @@ class EDANE:
         self.fusion_weight_decay = float(fusion_weight_decay)
         self.use_attr_fusion = bool(use_attr_fusion)
         self.use_hyperbolic_fusion = bool(use_hyperbolic_fusion)
+        if backend not in ("numpy", "torch"):
+            raise ValueError("backend must be either 'numpy' or 'torch'.")
+        self.backend: BackendName = backend
+        self.torch_dtype = torch_dtype
+        self.torch_device = torch_device
+        if self.backend == "torch" and not _TORCH_AVAILABLE:
+            raise ImportError("backend='torch' requires the optional dependency 'torch'.")
         self.rng = np.random.default_rng(random_state)
 
         self.adj: Optional[SparseMatrix] = None
@@ -233,6 +267,92 @@ class EDANE:
         self.binary_error_: float = 0.0
         self.quantization_compression_ratio_: float = 1.0
         self.binary_compression_ratio_: float = 1.0
+
+    def _use_torch_backend(self) -> bool:
+        return self.backend == "torch"
+
+    def _get_torch_dtype(self):
+        if not _TORCH_AVAILABLE:
+            raise ImportError("PyTorch is not available.")
+        torch_module = importlib.import_module("torch")
+        dtype = getattr(torch_module, self.torch_dtype, None)
+        if dtype is None:
+            raise ValueError(f"Unsupported torch dtype: {self.torch_dtype}")
+        return dtype
+
+    def _torch_tensor(self, value: object):
+        if not _TORCH_AVAILABLE:
+            raise ImportError("PyTorch is not available.")
+        torch_module = importlib.import_module("torch")
+        return torch_module.as_tensor(value, dtype=self._get_torch_dtype(), device=self.torch_device)
+
+    def _dense_row_normalize(self, x: ArrayLike) -> ArrayLike:
+        if not self._use_torch_backend():
+            return _row_normalize(x)
+        torch_module = importlib.import_module("torch")
+        tensor = self._torch_tensor(x)
+        norms = torch_module.linalg.norm(tensor, dim=1, keepdim=True)
+        normalized = tensor / torch_module.clamp(norms, min=1e-12)
+        return _to_numpy(normalized)
+
+    def _dense_sigmoid(self, x: ArrayLike) -> ArrayLike:
+        if not self._use_torch_backend():
+            return _sigmoid(x)
+        torch_module = importlib.import_module("torch")
+        tensor = self._torch_tensor(x)
+        return _to_numpy(torch_module.sigmoid(torch_module.clamp(tensor, min=-20.0, max=20.0)))
+
+    def _dense_safe_norm(self, x: object, axis: int = 1, keepdims: bool = True):
+        if _is_torch_tensor(x):
+            torch_module = importlib.import_module("torch")
+            return torch_module.clamp(torch_module.linalg.norm(x, dim=axis, keepdim=keepdims), min=1e-12)
+        return _safe_norm(np.asarray(x, dtype=np.float64), axis=axis, keepdims=keepdims)
+
+    def _dense_exp_map_zero(self, x: ArrayLike) -> ArrayLike:
+        if not self._use_torch_backend():
+            return _exp_map_zero(x)
+        torch_module = importlib.import_module("torch")
+        tensor = self._torch_tensor(x)
+        norm = self._dense_safe_norm(tensor)
+        return _to_numpy(torch_module.tanh(norm) * tensor / norm)
+
+    def _dense_log_map_zero(self, y: ArrayLike) -> ArrayLike:
+        if not self._use_torch_backend():
+            return _log_map_zero(y)
+        torch_module = importlib.import_module("torch")
+        tensor = self._torch_tensor(y)
+        norm = torch_module.clamp(self._dense_safe_norm(tensor), min=1e-12, max=1.0 - 1e-6)
+        return _to_numpy(torch_module.atanh(norm) * tensor / norm)
+
+    def _dense_mobius_add(self, x: ArrayLike, y: ArrayLike) -> ArrayLike:
+        if not self._use_torch_backend():
+            return _mobius_add(x, y)
+        torch_module = importlib.import_module("torch")
+        x_tensor = self._torch_tensor(x)
+        y_tensor = self._torch_tensor(y)
+        x2 = torch_module.sum(x_tensor * x_tensor, dim=1, keepdim=True)
+        y2 = torch_module.sum(y_tensor * y_tensor, dim=1, keepdim=True)
+        xy = torch_module.sum(x_tensor * y_tensor, dim=1, keepdim=True)
+        numerator = (1.0 + 2.0 * xy + y2) * x_tensor + (1.0 - x2) * y_tensor
+        denominator = 1.0 + 2.0 * xy + x2 * y2
+        result = numerator / torch_module.clamp(denominator, min=1e-12)
+        norm = self._dense_safe_norm(result)
+        clipped = torch_module.minimum(norm, torch_module.full_like(norm, 1.0 - 1e-5))
+        return _to_numpy(result * (clipped / norm))
+
+    def _dense_mobius_scalar_mul(self, weight: ArrayLike, x: ArrayLike) -> ArrayLike:
+        if not self._use_torch_backend():
+            return _mobius_scalar_mul(weight, x)
+        torch_module = importlib.import_module("torch")
+        weight_tensor = self._torch_tensor(weight)
+        x_tensor = self._torch_tensor(x)
+        norm = self._dense_safe_norm(x_tensor)
+        scaled = torch_module.tanh(
+            weight_tensor * torch_module.atanh(torch_module.clamp(norm, min=1e-12, max=1.0 - 1e-6))
+        ) * x_tensor / norm
+        new_norm = self._dense_safe_norm(scaled)
+        clipped = torch_module.minimum(new_norm, torch_module.full_like(new_norm, 1.0 - 1e-5))
+        return _to_numpy(scaled * (clipped / new_norm))
 
     def fit(self, adj: AdjLike, attrs: ArrayLike) -> "EDANE":
         """在初始快照上训练并生成初始嵌入。
@@ -340,8 +460,11 @@ class EDANE:
     def _compute_attribute_embedding(self, attrs: ArrayLike) -> ArrayLike:
         """计算属性嵌入 H_x = X W_x。"""
         assert self.attr_projection is not None
-        attr_emb = attrs @ self.attr_projection
-        return _row_normalize(attr_emb)
+        if not self._use_torch_backend():
+            attr_emb = attrs @ self.attr_projection
+            return _row_normalize(attr_emb)
+        attr_emb = self._torch_tensor(attrs) @ self._torch_tensor(self.attr_projection)
+        return self._dense_row_normalize(_to_numpy(attr_emb))
 
     def _init_fusion_gate_parameters(self) -> None:
         """初始化融合门控参数：alpha = sigmoid(W[p_s||p_a] + b)。"""
@@ -351,8 +474,8 @@ class EDANE:
 
     def _build_fusion_gate_features(self, struct_emb: ArrayLike, attr_emb: ArrayLike) -> Tuple[ArrayLike, ArrayLike, ArrayLike]:
         """构造双曲融合门控特征。"""
-        struct_h = _exp_map_zero(0.5 * struct_emb)
-        attr_h = _exp_map_zero(0.5 * attr_emb)
+        struct_h = self._dense_exp_map_zero(0.5 * struct_emb)
+        attr_h = self._dense_exp_map_zero(0.5 * attr_emb)
         features = np.concatenate([struct_h, attr_h], axis=1)
         return features, struct_h, attr_h
 
@@ -361,8 +484,11 @@ class EDANE:
         if self.fusion_weight_ is None:
             self._init_fusion_gate_parameters()
         assert self.fusion_weight_ is not None
-        logits = features @ self.fusion_weight_ + self.fusion_bias_
-        return _sigmoid(logits)
+        if not self._use_torch_backend():
+            logits = features @ self.fusion_weight_ + self.fusion_bias_
+            return _sigmoid(logits)
+        logits = self._torch_tensor(features) @ self._torch_tensor(self.fusion_weight_) + self.fusion_bias_
+        return self._dense_sigmoid(_to_numpy(logits))
 
     def _train_fusion_gate(self, struct_emb: ArrayLike, attr_emb: ArrayLike) -> None:
         """轻量训练融合门控参数（无监督伪目标）。"""
@@ -373,8 +499,24 @@ class EDANE:
         assert self.fusion_weight_ is not None
 
         features, _, _ = self._build_fusion_gate_features(struct_emb, attr_emb)
-        target = _sigmoid(np.sum(struct_emb * attr_emb, axis=1, keepdims=True) / math.sqrt(max(self.dim, 1)))
+        target = self._dense_sigmoid(np.sum(struct_emb * attr_emb, axis=1, keepdims=True) / math.sqrt(max(self.dim, 1)))
         n = max(features.shape[0], 1)
+
+        if self._use_torch_backend():
+            torch_module = importlib.import_module("torch")
+            weight = self._torch_tensor(self.fusion_weight_)
+            features_tensor = self._torch_tensor(features)
+            target_tensor = self._torch_tensor(target)
+            for _ in range(self.fusion_train_steps):
+                logits = features_tensor @ weight + self.fusion_bias_
+                pred = torch_module.sigmoid(torch_module.clamp(logits, min=-20.0, max=20.0))
+                diff = pred - target_tensor
+                grad_w = (features_tensor.transpose(0, 1) @ diff) / n + self.fusion_weight_decay * weight
+                grad_b = float(torch_module.mean(diff).item())
+                weight = weight - self.fusion_lr * grad_w
+                self.fusion_bias_ = self.fusion_bias_ - self.fusion_lr * grad_b
+            self.fusion_weight_ = _to_numpy(weight)
+            return
 
         for _ in range(self.fusion_train_steps):
             logits = features @ self.fusion_weight_ + self.fusion_bias_
@@ -398,15 +540,15 @@ class EDANE:
         features, struct_h, attr_h = self._build_fusion_gate_features(struct_emb, attr_emb)
         gate = self._compute_fusion_gate(features)
         if self.use_hyperbolic_fusion:
-            left = _mobius_scalar_mul(gate, struct_h)
-            right = _mobius_scalar_mul(1.0 - gate, attr_h)
-            fused_h = _mobius_add(left, right)
-            fused = _log_map_zero(fused_h)
-            return _row_normalize(fused)
+            left = self._dense_mobius_scalar_mul(gate, struct_h)
+            right = self._dense_mobius_scalar_mul(1.0 - gate, attr_h)
+            fused_h = self._dense_mobius_add(left, right)
+            fused = self._dense_log_map_zero(fused_h)
+            return self._dense_row_normalize(fused)
 
         # 消融：w/o-Hyperbolic，保持门控但改为欧氏空间融合。
         fused_euclidean = gate * struct_emb + (1.0 - gate) * attr_emb
-        return _row_normalize(fused_euclidean)
+        return self._dense_row_normalize(fused_euclidean)
 
     def _refresh_quantized_embedding(self) -> None:
         """更新模块四压缩副本：int8 量化 + 可选二值化。"""
@@ -419,9 +561,18 @@ class EDANE:
             self.quantization_error_ = 0.0
             self.quantization_compression_ratio_ = 1.0
         else:
-            max_abs = np.max(np.abs(self.embedding_), axis=0, keepdims=True)
-            scale = np.maximum(max_abs / 127.0, 1e-8)
-            values = np.clip(np.round(self.embedding_ / scale), -127, 127).astype(np.int8)
+            if self._use_torch_backend():
+                torch_module = importlib.import_module("torch")
+                embedding_tensor = self._torch_tensor(self.embedding_)
+                max_abs = torch_module.amax(torch_module.abs(embedding_tensor), dim=0, keepdim=True)
+                scale = torch_module.clamp(max_abs / 127.0, min=1e-8)
+                values = torch_module.clamp(torch_module.round(embedding_tensor / scale), min=-127, max=127)
+                scale = _to_numpy(scale)
+                values = _to_numpy(values).astype(np.int8)
+            else:
+                max_abs = np.max(np.abs(self.embedding_), axis=0, keepdims=True)
+                scale = np.maximum(max_abs / 127.0, 1e-8)
+                values = np.clip(np.round(self.embedding_ / scale), -127, 127).astype(np.int8)
             self.quantized_embedding_ = QuantizedEmbedding(values=values, scale=scale)
             restored = self.quantized_embedding_.dequantize()
             self.quantization_error_ = float(
@@ -435,7 +586,16 @@ class EDANE:
             self.binary_error_ = 0.0
             self.binary_compression_ratio_ = 1.0
         else:
-            binary_values = np.where(self.embedding_ >= 0.0, 1.0, -1.0).astype(np.float32)
+            if self._use_torch_backend():
+                torch_module = importlib.import_module("torch")
+                binary_values = torch_module.where(
+                    self._torch_tensor(self.embedding_) >= 0.0,
+                    torch_module.ones_like(self._torch_tensor(self.embedding_)),
+                    -torch_module.ones_like(self._torch_tensor(self.embedding_)),
+                )
+                binary_values = _to_numpy(binary_values).astype(np.float32)
+            else:
+                binary_values = np.where(self.embedding_ >= 0.0, 1.0, -1.0).astype(np.float32)
             self.binary_embedding_ = BinaryEmbedding(values=binary_values)
             restored_binary = self.binary_embedding_.dequantize()
             self.binary_error_ = float(
@@ -695,5 +855,5 @@ class EDANE:
 
 def cosine_scores(embedding: ArrayLike, pairs: Sequence[Tuple[int, int]]) -> ArrayLike:
     """计算节点对余弦相似度，用于链路预测打分。"""
-    emb = _row_normalize(embedding)
+    emb = _row_normalize(_to_numpy(embedding))
     return np.array([float(np.dot(emb[u], emb[v])) for u, v in pairs], dtype=np.float64)

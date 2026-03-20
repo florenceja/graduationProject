@@ -739,38 +739,75 @@ def save_metrics_curves_svg(metrics_rows: List[Dict[str, float]], output_path: s
         f.write("\n".join(svg_lines))
 
 
-_ALL_RESULTS_COLUMNS = [
-    "dataset", "run_dir", "mode", "dataset_preset", "snapshot_mode", "seed", "classifier",
-    "num_nodes", "feature_dim", "embedding_dim",
-    "num_snapshots", "initialization_latency_ms", "avg_update_latency_ms",
-    "avg_compute_update_latency_ms", "avg_pacing_wait_ms",
-    "p95_update_latency_ms", "final_macro_f1", "final_micro_f1",
-    "final_link_auc", "final_link_ap", "final_reconstruction_auc",
-    "ablation_tag", "update_rate", "effective_update_rate",
-    "quantization_compression_ratio", "quantization_error",
-    "binary_compression_ratio", "binary_error", "output_dir",
+_ALL_RESULTS_COLUMN_MAPPINGS = [
+    ("dataset", ("dataset",)),
+    ("variant", ("variant", "ablation_tag")),
+    ("binary", ("binary", "binary_quantize")),
+    ("update_rate", ("update_rate",)),
+    ("nodes", ("nodes", "num_nodes")),
+    ("init_ms", ("init_ms", "initialization_latency_ms")),
+    ("update_ms", ("update_ms", "avg_update_latency_ms")),
+    ("macro_f1", ("macro_f1", "final_macro_f1")),
+    ("micro_f1", ("micro_f1", "final_micro_f1")),
+    ("link_auc", ("link_auc", "final_link_auc")),
+    ("link_ap", ("link_ap", "final_link_ap")),
+    ("recon_auc", ("recon_auc", "final_reconstruction_auc")),
+    ("compression_x", ("compression_x", "quantization_compression_ratio")),
 ]
+
+_ALL_RESULTS_COLUMNS = [col for col, _ in _ALL_RESULTS_COLUMN_MAPPINGS]
+
+
+def _pick_first_available(row: dict, keys: Sequence[str]) -> str:
+    """按顺序读取首个可用字段值，用于兼容旧版汇总表。"""
+    for key in keys:
+        value = row.get(key, "")
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text != "":
+            return value
+    return ""
 
 
 def _append_to_all_results(
     project_root: str, dataset_tag: str, summary: dict
 ) -> None:
-    """将本次实验结果追加到 all_results.csv（同一 dataset_tag 仅保留最新一行）。"""
-    csv_path = os.path.join(project_root, "all_results.csv")
-    run_dir = os.path.basename(summary["output_dir"])
+    """将本次实验结果追加到 all_results.csv。
 
+    设计原则：
+    1. 每次运行保留一行，避免同一数据集不同配置互相覆盖；
+    2. 汇总表只保留“关键实验特征 + 关键指标”，便于阅读与论文整理；
+    3. 若历史 all_results.csv 存在更多旧字段，则在重写时自动裁剪到当前精简字段集合。
+    """
+    csv_path = os.path.join(project_root, "all_results.csv")
     existing_rows: list = []
     if os.path.exists(csv_path):
         with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                if row.get("dataset") != dataset_tag:
-                    existing_rows.append(row)
+                existing_rows.append(
+                    {
+                        col: _pick_first_available(row, aliases)
+                        for col, aliases in _ALL_RESULTS_COLUMN_MAPPINGS
+                    }
+                )
 
-    new_row = {"dataset": dataset_tag, "run_dir": run_dir}
-    for col in _ALL_RESULTS_COLUMNS:
-        if col not in new_row:
-            new_row[col] = summary.get(col, "")
+    new_row = {
+        "dataset": dataset_tag,
+        "variant": summary.get("ablation_tag", ""),
+        "binary": summary.get("binary_quantize", ""),
+        "update_rate": summary.get("update_rate", ""),
+        "nodes": summary.get("num_nodes", ""),
+        "init_ms": summary.get("initialization_latency_ms", ""),
+        "update_ms": summary.get("avg_update_latency_ms", ""),
+        "macro_f1": summary.get("final_macro_f1", ""),
+        "micro_f1": summary.get("final_micro_f1", ""),
+        "link_auc": summary.get("final_link_auc", ""),
+        "link_ap": summary.get("final_link_ap", ""),
+        "recon_auc": summary.get("final_reconstruction_auc", ""),
+        "compression_x": summary.get("quantization_compression_ratio", ""),
+    }
     existing_rows.append(new_row)
 
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
@@ -893,6 +930,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
         random_state=args.seed,
         use_attr_fusion=not args.no_attr,
         use_hyperbolic_fusion=not args.no_hyperbolic,
+        backend=args.backend,
     )
 
     start = time.perf_counter()
@@ -1022,6 +1060,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
         "snapshot_mode": args.snapshot_mode,
         "seed": int(args.seed),
         "classifier": args.classifier,
+        "backend": args.backend,
+        "quantize": bool(args.quantize),
+        "binary_quantize": bool(args.binary_quantize),
         "num_nodes": int(final_embedding.shape[0]),
         "feature_dim": int(attrs.shape[1]),
         "embedding_dim": int(final_embedding.shape[1]),
@@ -1097,6 +1138,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-inc", action="store_true", help="消融：禁用增量更新，改为每快照全量重训练（w/o-Inc）")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--classifier", choices=["centroid", "logreg"], default="logreg")
+    parser.add_argument(
+        "--backend",
+        choices=["numpy", "torch"],
+        default="numpy",
+        help="dense 数值后端；torch 模式仍保留 SciPy 稀疏图操作",
+    )
     parser.add_argument("--logreg-epochs", type=int, default=260)
     parser.add_argument("--logreg-lr", type=float, default=0.35)
     parser.add_argument("--logreg-weight-decay", type=float, default=1e-4)

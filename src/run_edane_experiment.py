@@ -6,6 +6,7 @@
 - 便于在没有真实数据时先做功能自检
 """
 
+import argparse
 import time
 from typing import Dict, List, Sequence, Tuple
 
@@ -209,8 +210,15 @@ def generate_dynamic_events(
     return edge_batches, attr_batches
 
 
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="EDANE 轻量实验脚本")
+    parser.add_argument("--backend", choices=["numpy", "torch"], default="numpy")
+    return parser
+
+
 def main() -> None:
     """实验主入口。"""
+    args = build_parser().parse_args()
     adj, attrs, labels = generate_synthetic_dynamic_graph()
 
     model = EDANE(
@@ -220,6 +228,7 @@ def main() -> None:
         learning_rate=0.55,
         quantize=True,
         random_state=42,
+        backend=args.backend,
     )
 
     start = time.perf_counter()
@@ -263,6 +272,7 @@ def main() -> None:
     print(f"nodes: {adj.shape[0]}")
     print(f"feature_dim: {attrs.shape[1]}")
     print(f"embedding_dim: {updated_embedding.shape[1]}")
+    print(f"backend: {args.backend}")
     print(f"initialization_latency_ms: {init_latency_ms:.3f}")
     print(f"avg_update_latency_ms: {np.mean(update_times):.3f}")
     print(f"p95_update_latency_ms: {np.percentile(update_times, 95):.3f}")

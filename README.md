@@ -5,7 +5,7 @@
 ## 核心特性
 
 - **显式优化初始化** — 稀疏随机投影锚点 + 目标函数迭代优化
-- **严格版增量更新** — 支持 `ΔV+ / ΔV- / ΔE+ / ΔE-` 与属性更新
+- **局部增量更新** — 支持 `ΔV+ / ΔV- / ΔE+ / ΔE-` 与属性更新的工程化近似更新
 - **可学习双曲门控融合** — 结构与属性在 Poincaré 球空间中自适应融合
 - **量化压缩模块** — int8 主量化 + 可选 binary 副本 + 压缩误差统计
 - **稀疏矩阵后端** — 基于 SciPy CSR，显著降低大图内存占用
@@ -21,17 +21,20 @@
 ├── docs/                         文档
 │   ├── algorithm.md              算法理论说明
 │   ├── development.md            开发指南
+│   ├── evaluation_metrics_design_usage.md  评估指标设计说明
 │   ├── getting_started.md        快速上手
 │   ├── pipeline_usage.md         流水线详细用法
-│   └── thesis_evaluation_conclusion_auto.md  论文结论（自动生成）
+│   └── modules_1_4_integrated.md 模块一至模块四整合文档
+│
+├── dataset/                      项目内原始数据目录（本地使用，优先被 prepare_datasets.py 读取）
 │
 ├── src/                          源代码
 │   ├── edane.py                  算法核心
 │   ├── edane_full_pipeline.py    端到端实验流水线
 │   ├── prepare_datasets.py       数据预处理
 │   ├── plot_metrics_svg.py       SVG 曲线绘图
-│   ├── generate_thesis_conclusion.py  论文结论自动生成
-│   └── run_edane_experiment.py   轻量快速验证
+│   ├── run_edane_experiment.py   轻量快速验证
+│   └── run_stage23_experiments.py 阶段2/3矩阵实验脚本
 │
 ├── data/                         预处理后的数据集
 │   ├── reddit_sample/
@@ -40,8 +43,14 @@
 │   ├── mag_sample/
 │   └── twitter_sample/
 │
-└── outputs/                      实验输出（按时间戳分目录）
+└── outputs/                      实验输出（按时间戳分目录，本地生成，默认不提交）
 ```
+
+补充约定：
+
+- 当前推荐把原始数据放在项目根目录下的 `dataset/`；
+- `prepare_datasets.py` 当前按项目内 `dataset/` 作为默认原始数据目录；
+- `dataset/` 与 `outputs/` 现在按本地数据/本地实验产物管理，不建议直接当作远程仓库正文提交。
 
 ## 快速开始
 
@@ -49,7 +58,7 @@
 # 1. 安装依赖
 pip install -r requirements.txt
 
-# 2. 准备数据（从 D:\毕设资料\dataset 生成样本）
+# 2. 准备数据（优先从项目内 dataset/ 生成样本）
 python src/prepare_datasets.py --prepare-reddit --prepare-amazon --prepare-amazon3m --prepare-mag --prepare-twitter
 
 # 3. 运行实验
@@ -108,13 +117,29 @@ python src/run_stage23_experiments.py --mode synthetic --snapshots 2 --stage2-ra
 | [流水线用法](docs/pipeline_usage.md) | 完整命令、参数、数据格式 |
 | [算法说明](docs/algorithm.md) | 理论背景、数学推导 |
 | [开发指南](docs/development.md) | 项目架构、扩展方法 |
-| [模块一文档](docs/module1_initialization_design_usage.md) | 初始化设计与使用 |
-| [模块二文档](docs/module2_incremental_update_design_usage.md) | 动态增量更新设计与使用 |
-| [模块三文档](docs/module3_hyperbolic_fusion_design_usage.md) | 双曲融合设计与使用 |
-| [模块四文档](docs/module4_storage_quantization_design_usage.md) | 量化压缩设计与使用 |
+| [评估指标文档](docs/evaluation_metrics_design_usage.md) | Macro/Micro-F1、AUC、AP、重构与时延指标说明 |
+| [模块整合文档](docs/modules_1_4_integrated.md) | 模块一至模块四的统一设计说明 |
 
 ## 环境要求
 
 - Python ≥ 3.9
 - NumPy
 - SciPy（稀疏矩阵）
+
+## 当前实现定位
+
+当前项目是一个**可运行的 EDANE 研究原型**，已经覆盖：
+
+- 数据预处理
+- 初始化训练
+- 动态增量更新
+- 结构/属性融合
+- 节点分类与链路预测评估
+- 实验结果导出
+
+但它仍然是：
+
+- 单机原型优先；
+- NumPy/SciPy 主导，PyTorch 仅为可选 dense 后端；
+- 面向毕业设计/课程实验/方法验证；
+- 不是工业级分布式生产系统。
