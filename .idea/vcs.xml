@@ -2,5 +2,9 @@
 <project version="4">
   <component name="VcsDirectoryMappings">
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/%TMP%/DTFormer" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/vendor_research/click" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/vendor_research/pytest" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/vendor_research/setuptools" vcs="Git" />
   </component>
 </project>

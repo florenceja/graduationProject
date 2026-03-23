@@ -20,10 +20,21 @@ from typing import Dict, List, Sequence
 
 SUMMARY_FIELDS: Sequence[str] = (
     "mode",
-    "dataset_preset",
+    "dataset",
+    "dataset_source_url",
+    "model",
+    "implementation_fidelity",
     "snapshot_mode",
     "seed",
     "classifier",
+    "logreg_class_weight",
+    "f1_eval_protocol",
+    "f1_eval_protocol_used",
+    "f1_eval_repeats",
+    "f1_eval_successful_repeats",
+    "f1_eval_train_ratio",
+    "label_cleanup_mode",
+    "min_class_support",
     "num_nodes",
     "feature_dim",
     "embedding_dim",
@@ -34,7 +45,15 @@ SUMMARY_FIELDS: Sequence[str] = (
     "avg_pacing_wait_ms",
     "p95_update_latency_ms",
     "final_macro_f1",
+    "final_macro_f1_std",
     "final_micro_f1",
+    "final_micro_f1_std",
+    "final_labeled_nodes_raw",
+    "final_labeled_nodes",
+    "final_eval_dropped_labeled_nodes",
+    "final_eval_class_count_raw",
+    "final_eval_class_count",
+    "final_eval_dropped_class_count",
     "final_link_auc",
     "final_link_ap",
     "final_reconstruction_auc",
@@ -96,6 +115,8 @@ def _build_common_args(args: argparse.Namespace) -> List[str]:
         pipeline_path,
         "--mode",
         args.mode,
+        "--model",
+        args.model,
         "--snapshots",
         str(args.snapshots),
         "--dim",
@@ -108,29 +129,49 @@ def _build_common_args(args: argparse.Namespace) -> List[str]:
         str(args.seed),
         "--classifier",
         args.classifier,
+        "--logreg-epochs",
+        str(args.logreg_epochs),
+        "--logreg-lr",
+        str(args.logreg_lr),
+        "--logreg-weight-decay",
+        str(args.logreg_weight_decay),
+        "--logreg-class-weight",
+        args.logreg_class_weight,
+        "--eval-protocol",
+        args.eval_protocol,
+        "--eval-repeats",
+        str(args.eval_repeats),
+        "--eval-train-ratio",
+        str(args.eval_train_ratio),
+        "--label-cleanup-mode",
+        args.label_cleanup_mode,
+        "--min-class-support",
+        str(args.min_class_support),
     ]
-    if args.quantize:
+    if args.quantize and args.model == "edane":
         common.append("--quantize")
-    if args.binary_quantize:
+    if args.binary_quantize and args.model == "edane":
         common.append("--binary-quantize")
 
     if args.mode == "file":
-        if not args.dataset_preset:
-            raise ValueError("file 模式需要提供 --dataset-preset")
-        common.extend(["--dataset-preset", args.dataset_preset])
         common.extend(["--max-nodes", str(args.max_nodes)])
     else:
         common.extend(["--synthetic-nodes", str(args.synthetic_nodes)])
         common.extend(["--synthetic-classes", str(args.synthetic_classes)])
         common.extend(["--synthetic-feat-dim", str(args.synthetic_feat_dim)])
         common.extend(["--synthetic-rounds", str(args.synthetic_rounds)])
+    if args.model == "dtformer":
+        common.extend(["--dtformer-patch-size", str(args.dtformer_patch_size)])
+        common.extend(["--dtformer-history-snapshots", str(args.dtformer_history_snapshots)])
+        common.extend(["--dtformer-hidden-dim", str(args.dtformer_hidden_dim)])
+        common.extend(["--dtformer-attention-temperature", str(args.dtformer_attention_temperature)])
     return common
 
 
 def run_stage23_matrix(args: argparse.Namespace) -> None:
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    tag = args.dataset_preset if args.mode == "file" else "synthetic"
+    tag = "oag" if args.mode == "file" else "synthetic"
     out_root = args.output_root or os.path.join(project_root, "outputs", f"stage23_matrix_{tag}_{timestamp}")
     os.makedirs(out_root, exist_ok=True)
 
@@ -165,12 +206,22 @@ def run_stage23_matrix(args: argparse.Namespace) -> None:
         extra_fields=("phase", "variant", "target_update_rate"),
     )
 
-    stage3_variants = [
-        ("full", []),
-        ("w/o-Attr", ["--no-attr"]),
-        ("w/o-Hyperbolic", ["--no-hyperbolic"]),
-        ("w/o-Inc", ["--no-inc"]),
-    ]
+    if args.model == "edane":
+        stage3_variants = [
+            ("full", []),
+            ("w/o-Attr", ["--no-attr"]),
+            ("w/o-Hyperbolic", ["--no-hyperbolic"]),
+            ("w/o-Inc", ["--no-inc"]),
+        ]
+    elif args.model == "dane":
+        stage3_variants = [
+            ("full", []),
+            ("w/o-Inc", ["--no-inc"]),
+        ]
+    else:
+        stage3_variants = [
+            ("full", []),
+        ]
     stage3_rows: List[Dict[str, object]] = []
     for variant, flags in stage3_variants:
         run_dir = os.path.join(out_root, f"stage3_{variant.replace('/', '_')}")
@@ -204,7 +255,7 @@ def run_stage23_matrix(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="阶段2/3实验矩阵一键脚本")
     parser.add_argument("--mode", choices=["file", "synthetic"], default="file")
-    parser.add_argument("--dataset-preset", type=str, default="reddit_sample")
+    parser.add_argument("--model", choices=["edane", "dane", "dtformer"], default="edane")
     parser.add_argument("--output-root", type=str, default="")
 
     parser.add_argument("--snapshots", type=int, default=3)
@@ -213,6 +264,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float, default=0.55)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--classifier", choices=["centroid", "logreg"], default="logreg")
+    parser.add_argument("--logreg-epochs", type=int, default=260)
+    parser.add_argument("--logreg-lr", type=float, default=0.35)
+    parser.add_argument("--logreg-weight-decay", type=float, default=1e-4)
+    parser.add_argument("--logreg-class-weight", choices=["none", "balanced"], default="none")
+    parser.add_argument("--eval-protocol", choices=["single_random", "repeated_stratified"], default="repeated_stratified")
+    parser.add_argument("--eval-repeats", type=int, default=10)
+    parser.add_argument("--eval-train-ratio", type=float, default=0.7)
+    parser.add_argument("--label-cleanup-mode", choices=["off", "eval_only"], default="off")
+    parser.add_argument("--min-class-support", type=int, default=5)
     parser.add_argument("--max-nodes", type=int, default=10000)
     parser.add_argument("--quantize", dest="quantize", action="store_true")
     parser.add_argument("--no-quantize", dest="quantize", action="store_false")
@@ -221,6 +281,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage2-rates", type=str, default="10,100,1000")
     parser.add_argument("--include-no-inc-stage2", action="store_true")
     parser.add_argument("--stage3-update-rate", type=int, default=0)
+    parser.add_argument("--dtformer-patch-size", type=int, default=2)
+    parser.add_argument("--dtformer-history-snapshots", type=int, default=8)
+    parser.add_argument("--dtformer-hidden-dim", type=int, default=96)
+    parser.add_argument("--dtformer-attention-temperature", type=float, default=1.0)
 
     parser.add_argument("--synthetic-nodes", type=int, default=600)
     parser.add_argument("--synthetic-classes", type=int, default=6)

@@ -16,7 +16,7 @@
 ├── README.md                     ← 你在这里
 ├── requirements.txt              Python 依赖
 ├── run_all.bat                   一键实验（Windows）
-├── all_results.csv               多数据集汇总表
+├── all_results.csv               实验汇总表
 │
 ├── docs/                         文档
 │   ├── algorithm.md              算法理论说明
@@ -26,7 +26,8 @@
 │   ├── pipeline_usage.md         流水线详细用法
 │   └── modules_1_4_integrated.md 模块一至模块四整合文档
 │
-├── dataset/                      项目内原始数据目录（本地使用，优先被 prepare_datasets.py 读取）
+├── dataset/                      项目内真实数据目录
+│   └── OAG/                      固定数据集目录（后续 file 模式仅使用它）
 │
 ├── src/                          源代码
 │   ├── edane.py                  算法核心
@@ -36,21 +37,30 @@
 │   ├── run_edane_experiment.py   轻量快速验证
 │   └── run_stage23_experiments.py 阶段2/3矩阵实验脚本
 │
-├── data/                         预处理后的数据集
-│   ├── reddit_sample/
-│   ├── amazon2m_sample/
-│   ├── amazon3m_sample/
-│   ├── mag_sample/
-│   └── twitter_sample/
-│
 └── outputs/                      实验输出（按时间戳分目录，本地生成，默认不提交）
 ```
 
 补充约定：
 
-- 当前推荐把原始数据放在项目根目录下的 `dataset/`；
-- `prepare_datasets.py` 当前按项目内 `dataset/` 作为默认原始数据目录；
+- 当前 file 模式固定使用项目根目录下的 `dataset/OAG/`；
+- `prepare_datasets.py` 现在既支持把 OAG zip 转成统一 CSV，也支持检查 `dataset/OAG/` 是否满足输入要求；
 - `dataset/` 与 `outputs/` 现在按本地数据/本地实验产物管理，不建议直接当作远程仓库正文提交。
+
+数据来源说明：
+
+- 固定数据集来源页：`https://open.aminer.cn/open/article?id=67aaf63af4cbd12984b6a5f0`
+- 可安全写入项目说明的出处口径：该来源页托管于 **AMiner Open Platform（AMiner开放数据平台）**。
+
+OAG 转换口径说明：
+
+- 当前脚本构造的是一个 **OAG-derived 动态属性引文基准**；
+- `references` 被映射为边，`year` 被映射为时间，`venue` 被映射为单标签，`title + abstract + keywords` 被映射为文本哈希特征；
+- 这不是 OAG 官方任务定义的逐项复刻，而是为了适配当前统一的 `edges/features/labels` 流水线。
+
+规模提醒：
+
+- 转换脚本支持流式扫描 OAG zip；
+- 但当前 `edane_full_pipeline.py` 在 file 模式下仍会一次性读入 CSV，因此**全量 OAG 转换结果未必适合在普通内存环境下直接跑全图**，通常需要结合 `--max-nodes` 使用。
 
 ## 快速开始
 
@@ -58,22 +68,22 @@
 # 1. 安装依赖
 pip install -r requirements.txt
 
-# 2. 准备数据（优先从项目内 dataset/ 生成样本）
-python src/prepare_datasets.py --prepare-reddit --prepare-amazon --prepare-amazon3m --prepare-mag --prepare-twitter
+# 2. 将 OAG 原始 zip 转成固定 CSV（首次）
+python src/prepare_datasets.py --convert-oag --overwrite
+
+# 或仅检查固定数据集 dataset/OAG
+python src/prepare_datasets.py --validate-only
 
 # 3. 运行实验
 python src/edane_full_pipeline.py --mode synthetic --quantize
-python src/edane_full_pipeline.py --mode file --dataset-preset reddit_sample --snapshots 6 --quantize
-python src/edane_full_pipeline.py --mode file --dataset-preset reddit_sample --snapshots 6 --quantize --binary-quantize
-python src/edane_full_pipeline.py --mode file --dataset-preset reddit_sample --snapshots 6 --quantize --update-rate 100
-python src/edane_full_pipeline.py --mode file --dataset-preset mag_sample --snapshots 6 --quantize
-python src/edane_full_pipeline.py --mode file --dataset-preset twitter_sample --snapshots 6 --quantize
-python src/edane_full_pipeline.py --mode file --dataset-preset amazon3m_sample --snapshots 6 --quantize
+python src/edane_full_pipeline.py --mode file --snapshots 6 --quantize
+python src/edane_full_pipeline.py --mode file --snapshots 6 --quantize --binary-quantize
+python src/edane_full_pipeline.py --mode file --snapshots 6 --quantize --update-rate 100
 
 # 消融实验
-python src/edane_full_pipeline.py --mode file --dataset-preset reddit_sample --snapshots 6 --quantize --no-attr
-python src/edane_full_pipeline.py --mode file --dataset-preset reddit_sample --snapshots 6 --quantize --no-hyperbolic
-python src/edane_full_pipeline.py --mode file --dataset-preset reddit_sample --snapshots 6 --quantize --no-inc
+python src/edane_full_pipeline.py --mode file --snapshots 6 --quantize --no-attr
+python src/edane_full_pipeline.py --mode file --snapshots 6 --quantize --no-hyperbolic
+python src/edane_full_pipeline.py --mode file --snapshots 6 --quantize --no-inc
 
 # 或一键运行全部
 run_all.bat
@@ -97,13 +107,13 @@ run_all.bat
 
 ```bash
 # 阶段2：更新频率 10/100/1000；阶段3：full + 3个消融自动汇总
-python src/run_stage23_experiments.py --mode file --dataset-preset reddit_sample --snapshots 3 --max-nodes 3000
+python src/run_stage23_experiments.py --mode file --snapshots 3 --max-nodes 3000
 
 # 快速自检（synthetic）
 python src/run_stage23_experiments.py --mode synthetic --snapshots 2 --stage2-rates 10,100 --synthetic-rounds 6
 ```
 
-输出在 `outputs/stage23_matrix_<dataset>_<timestamp>/`：
+输出在 `outputs/stage23_matrix_oag_<timestamp>/`：
 
 - `stage2_rate_results.csv`（阶段2速率矩阵）
 - `stage3_ablation_results.csv`（阶段3消融矩阵）
@@ -118,6 +128,7 @@ python src/run_stage23_experiments.py --mode synthetic --snapshots 2 --stage2-ra
 | [算法说明](docs/algorithm.md) | 理论背景、数学推导 |
 | [开发指南](docs/development.md) | 项目架构、扩展方法 |
 | [评估指标文档](docs/evaluation_metrics_design_usage.md) | Macro/Micro-F1、AUC、AP、重构与时延指标说明 |
+| [评估设置对比](docs/evaluation_setting_comparison.md) | raw-label 与 cleaned-label 两种分类评估口径的对比与解释 |
 | [模块整合文档](docs/modules_1_4_integrated.md) | 模块一至模块四的统一设计说明 |
 
 ## 环境要求

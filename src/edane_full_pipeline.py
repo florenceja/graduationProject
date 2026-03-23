@@ -20,6 +20,8 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 import numpy as np
 from scipy import sparse
 
+from dane import DANE
+from dtformer import DTFormer
 from edane import EDANE, cosine_scores
 
 AdjLike = Union[np.ndarray, sparse.csr_matrix]
@@ -46,6 +48,92 @@ def train_test_split(indices: np.ndarray, train_ratio: float, seed: int) -> Tupl
     rng.shuffle(shuffled)
     split = int(len(shuffled) * train_ratio)
     return shuffled[:split], shuffled[split:]
+
+
+def stratified_train_test_split(
+    labels: np.ndarray,
+    indices: np.ndarray,
+    train_ratio: float,
+    seed: int,
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """按类别分层切分索引，保证每个类别在 train/test 中都至少出现一次。
+
+    若任一类别样本数不足 2，则返回 None，由上层决定是否回退到随机切分。
+    """
+    if len(indices) == 0:
+        return None
+    subset_labels = labels[indices]
+    classes, counts = np.unique(subset_labels, return_counts=True)
+    if len(classes) < 2 or np.any(counts < 2):
+        return None
+
+    rng = np.random.default_rng(seed)
+    train_parts: List[np.ndarray] = []
+    test_parts: List[np.ndarray] = []
+    for cls in classes:
+        cls_indices = indices[subset_labels == cls].copy()
+        rng.shuffle(cls_indices)
+        train_count = int(round(len(cls_indices) * train_ratio))
+        train_count = min(max(train_count, 1), len(cls_indices) - 1)
+        train_parts.append(cls_indices[:train_count])
+        test_parts.append(cls_indices[train_count:])
+
+    train_idx = np.concatenate(train_parts)
+    test_idx = np.concatenate(test_parts)
+    rng.shuffle(train_idx)
+    rng.shuffle(test_idx)
+    return train_idx, test_idx
+
+
+def prepare_labels_for_evaluation(
+    labels: np.ndarray,
+    cleanup_mode: str,
+    min_class_support: int,
+) -> Tuple[np.ndarray, Dict[str, Union[float, str]]]:
+    """按评估规则过滤低支持类别，并将保留标签重映射为连续整数。"""
+    filtered = np.asarray(labels, dtype=np.int64).copy()
+    raw_valid_nodes = np.where(filtered >= 0)[0]
+    raw_label_count = len(raw_valid_nodes)
+    raw_class_count = len(np.unique(filtered[raw_valid_nodes])) if raw_label_count > 0 else 0
+
+    metadata: Dict[str, Union[float, str]] = {
+        "label_cleanup_mode": cleanup_mode,
+        "min_class_support": float(max(min_class_support, 2)),
+        "labeled_nodes_raw": float(raw_label_count),
+        "eval_dropped_labeled_nodes": 0.0,
+        "eval_class_count_raw": float(raw_class_count),
+        "eval_class_count": float(raw_class_count),
+        "eval_dropped_class_count": 0.0,
+    }
+    if cleanup_mode != "eval_only" or raw_label_count == 0:
+        return filtered, metadata
+
+    effective_min_support = max(min_class_support, 2)
+    raw_labels = filtered[raw_valid_nodes]
+    unique_labels, counts = np.unique(raw_labels, return_counts=True)
+    kept_labels = [int(label) for label, count in zip(unique_labels.tolist(), counts.tolist()) if count >= effective_min_support]
+    kept_label_set = set(kept_labels)
+    if len(kept_label_set) < 2:
+        metadata["eval_dropped_labeled_nodes"] = float(raw_label_count)
+        metadata["eval_class_count"] = 0.0
+        metadata["eval_dropped_class_count"] = float(raw_class_count)
+        filtered[raw_valid_nodes] = -1
+        return filtered, metadata
+
+    dense_map = {label: idx for idx, label in enumerate(sorted(kept_label_set))}
+    dropped_nodes = 0
+    for node_idx in raw_valid_nodes:
+        label = int(filtered[node_idx])
+        if label not in kept_label_set:
+            filtered[node_idx] = -1
+            dropped_nodes += 1
+            continue
+        filtered[node_idx] = dense_map[label]
+
+    metadata["eval_dropped_labeled_nodes"] = float(dropped_nodes)
+    metadata["eval_class_count"] = float(len(kept_label_set))
+    metadata["eval_dropped_class_count"] = float(raw_class_count - len(kept_label_set))
+    return filtered, metadata
 
 
 def macro_micro_f1(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float, float]:
@@ -114,6 +202,8 @@ def softmax_logreg_predict(
     epochs: int = 250,
     lr: float = 0.3,
     weight_decay: float = 1e-4,
+    seed: int = 42,
+    class_weight_mode: str = "none",
 ) -> np.ndarray:
     """使用 NumPy 训练多分类 softmax 逻辑回归并预测。
 
@@ -135,15 +225,23 @@ def softmax_logreg_predict(
     x_test_b = np.hstack([x_test, np.ones((len(x_test), 1), dtype=np.float64)])
     d = x_train_b.shape[1]
 
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(seed)
     w = 0.01 * rng.normal(size=(d, num_classes))
 
     y_onehot = np.zeros((len(y_idx), num_classes), dtype=np.float64)
     y_onehot[np.arange(len(y_idx)), y_idx] = 1.0
 
+    sample_weights = np.ones(len(y_idx), dtype=np.float64)
+    if class_weight_mode == "balanced":
+        class_counts = np.bincount(y_idx, minlength=num_classes).astype(np.float64)
+        class_weights = len(y_idx) / np.maximum(class_counts * num_classes, 1e-12)
+        sample_weights = class_weights[y_idx]
+    normalizer = float(np.sum(sample_weights))
+
     for _ in range(max(20, epochs)):
         probs = _softmax(x_train_b @ w)
-        grad = (x_train_b.T @ (probs - y_onehot)) / len(x_train_b)
+        weighted_errors = (probs - y_onehot) * sample_weights[:, None]
+        grad = (x_train_b.T @ weighted_errors) / max(normalizer, 1e-12)
         # 不对偏置项做正则。
         reg = weight_decay * w
         reg[-1, :] = 0.0
@@ -241,34 +339,76 @@ def evaluate_snapshot(
     logreg_epochs: int,
     logreg_lr: float,
     logreg_weight_decay: float,
-) -> Dict[str, float]:
+    eval_protocol: str,
+    eval_repeats: int,
+    eval_train_ratio: float,
+    label_cleanup_mode: str,
+    min_class_support: int,
+    logreg_class_weight: str,
+) -> Dict[str, Union[float, str]]:
     """评估当前快照上的节点分类、链路预测与网络重构指标。"""
-    valid_nodes = np.where(labels >= 0)[0]
-    metrics: Dict[str, float] = {
+    eval_labels, label_meta = prepare_labels_for_evaluation(
+        labels,
+        cleanup_mode=label_cleanup_mode,
+        min_class_support=min_class_support,
+    )
+    valid_nodes = np.where(eval_labels >= 0)[0]
+    metrics: Dict[str, Union[float, str]] = {
         "macro_f1": 0.0,
         "micro_f1": 0.0,
+        "macro_f1_std": 0.0,
+        "micro_f1_std": 0.0,
         "link_auc": 0.0,
         "link_ap": 0.0,
         "reconstruction_auc": 0.0,
         "labeled_nodes": float(len(valid_nodes)),
+        **label_meta,
+        "f1_eval_repeats": float(max(eval_repeats, 1) if eval_protocol == "repeated_stratified" else 1),
+        "f1_eval_successful_repeats": 0.0,
+        "f1_eval_protocol": eval_protocol,
     }
     if len(valid_nodes) > 10:
-        train_idx, test_idx = train_test_split(valid_nodes, train_ratio=0.7, seed=seed)
-        if len(np.unique(labels[train_idx])) >= 2 and len(test_idx) > 0:
+        macro_scores: List[float] = []
+        micro_scores: List[float] = []
+        protocol_used = eval_protocol
+        total_repeats = max(eval_repeats, 1) if eval_protocol == "repeated_stratified" else 1
+        for repeat in range(total_repeats):
+            split_seed = seed + repeat
+            if eval_protocol == "repeated_stratified":
+                split = stratified_train_test_split(eval_labels, valid_nodes, train_ratio=eval_train_ratio, seed=split_seed)
+                if split is None:
+                    protocol_used = "single_random_fallback"
+                    split = train_test_split(valid_nodes, train_ratio=eval_train_ratio, seed=split_seed)
+            else:
+                split = train_test_split(valid_nodes, train_ratio=eval_train_ratio, seed=split_seed)
+
+            train_idx, test_idx = split
+            if len(train_idx) == 0 or len(test_idx) == 0 or len(np.unique(eval_labels[train_idx])) < 2:
+                continue
             if classifier == "logreg":
                 pred = softmax_logreg_predict(
                     train_x=embedding[train_idx],
-                    train_y=labels[train_idx],
+                    train_y=eval_labels[train_idx],
                     test_x=embedding[test_idx],
                     epochs=logreg_epochs,
                     lr=logreg_lr,
                     weight_decay=logreg_weight_decay,
+                    seed=split_seed,
+                    class_weight_mode=logreg_class_weight,
                 )
             else:
-                pred = nearest_centroid_predict(embedding, labels, train_idx, test_idx)
-            macro, micro = macro_micro_f1(labels[test_idx], pred)
-            metrics["macro_f1"] = macro
-            metrics["micro_f1"] = micro
+                pred = nearest_centroid_predict(embedding, eval_labels, train_idx, test_idx)
+            macro, micro = macro_micro_f1(eval_labels[test_idx], pred)
+            macro_scores.append(macro)
+            micro_scores.append(micro)
+
+        metrics["f1_eval_protocol"] = protocol_used
+        metrics["f1_eval_successful_repeats"] = float(len(macro_scores))
+        if macro_scores:
+            metrics["macro_f1"] = float(np.mean(macro_scores))
+            metrics["micro_f1"] = float(np.mean(micro_scores))
+            metrics["macro_f1_std"] = float(np.std(macro_scores))
+            metrics["micro_f1_std"] = float(np.std(micro_scores))
 
     pos_pairs, neg_pairs = sample_link_pairs(adj, sample_size=512, seed=seed)
     pos_scores = cosine_scores(embedding, pos_pairs) if pos_pairs else np.array([], dtype=np.float64)
@@ -672,7 +812,7 @@ def save_metrics_curves_svg(metrics_rows: List[Dict[str, float]], output_path: s
     svg_lines: List[str] = []
     svg_lines.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">')
     svg_lines.append('<rect x="0" y="0" width="100%" height="100%" fill="white"/>')
-    svg_lines.append('<text x="70" y="25" font-size="18" font-family="Arial">EDANE Metrics Curves</text>')
+    svg_lines.append('<text x="70" y="25" font-size="18" font-family="Arial">Embedding Metrics Curves</text>')
 
     # Axes
     svg_lines.append(f'<line x1="{margin_l}" y1="{top_y0}" x2="{margin_l}" y2="{top_y0 + top_h}" stroke="#333"/>')
@@ -821,15 +961,34 @@ def _build_run_tag(args: argparse.Namespace) -> str:
     """根据运行参数生成可读的目录名标签。"""
     if args.mode == "synthetic":
         return "synthetic"
-    if args.dataset_preset:
-        return args.dataset_preset.strip().lower()
-    if args.edges_path:
-        return os.path.splitext(os.path.basename(args.edges_path))[0]
-    return "custom"
+    return "oag"
+
+
+def _resolve_oag_dataset_paths(project_root: str) -> tuple[str, str, str, str]:
+    """Resolve the fixed OAG dataset directory for file-mode experiments."""
+    dataset_root = os.path.join(project_root, "dataset", "OAG")
+    if not os.path.isdir(dataset_root):
+        raise ValueError(
+            f"file 模式固定使用 dataset/OAG，但未找到目录: {dataset_root}。"
+            "请先将 OAG 数据放到 dataset/OAG/ 下。"
+        )
+
+    edges_path = os.path.join(dataset_root, "edges.csv")
+    features_path = os.path.join(dataset_root, "features.csv")
+    labels_path = os.path.join(dataset_root, "labels.csv")
+    attr_updates_path = os.path.join(dataset_root, "attr_updates.csv")
+    required = [edges_path, features_path, labels_path]
+    missing = [path for path in required if not os.path.isfile(path)]
+    if missing:
+        missing_text = ", ".join(missing)
+        raise ValueError(f"dataset/OAG 缺少必需文件: {missing_text}")
+    return edges_path, features_path, labels_path, attr_updates_path if os.path.isfile(attr_updates_path) else ""
 
 
 def _build_ablation_tag(args: argparse.Namespace) -> str:
     """根据开关生成消融标签。"""
+    if args.model != "edane":
+        return "w/o-Inc" if args.no_inc else "full"
     tags: list[str] = []
     if args.no_attr:
         tags.append("w/o-Attr")
@@ -838,6 +997,48 @@ def _build_ablation_tag(args: argparse.Namespace) -> str:
     if args.no_inc:
         tags.append("w/o-Inc")
     return "+".join(tags) if tags else "full"
+
+
+def build_model(args: argparse.Namespace):
+    """Construct embedding model from CLI args."""
+    if args.model != "edane" and (args.no_attr or args.no_hyperbolic):
+        raise ValueError("--no-attr and --no-hyperbolic are EDANE-specific ablations and are not supported for non-EDANE baselines.")
+    if args.model == "edane":
+        return EDANE(
+            dim=args.dim,
+            order=args.order,
+            projection_density=args.projection_density,
+            learning_rate=args.learning_rate,
+            quantize=args.quantize,
+            binary_quantize=args.binary_quantize,
+            random_state=args.seed,
+            use_attr_fusion=not args.no_attr,
+            use_hyperbolic_fusion=not args.no_hyperbolic,
+            backend=args.backend,
+        )
+    if args.model == "dane":
+        return DANE(
+            dim=args.dim,
+            attr_topk=args.dane_attr_topk,
+            similarity_block_size=args.dane_similarity_block_size,
+            perturbation_rank=args.dane_perturbation_rank,
+            random_state=args.seed,
+        )
+    return DTFormer(
+        dim=args.dim,
+        patch_size=args.dtformer_patch_size,
+        history_snapshots=args.dtformer_history_snapshots,
+        transformer_hidden_dim=args.dtformer_hidden_dim,
+        attention_temperature=args.dtformer_attention_temperature,
+        random_state=args.seed,
+    )
+
+
+def _quantization_enabled_for_model(args: argparse.Namespace) -> tuple[bool, bool]:
+    """Return effective quantization flags for the selected model."""
+    if args.model in {"dane", "dtformer"}:
+        return False, False
+    return bool(args.quantize), bool(args.binary_quantize)
 
 
 def _count_batch_events(batch: DynamicBatch) -> int:
@@ -884,23 +1085,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     ensure_dir(out_dir)
 
     if args.mode == "file":
-        # file 模式支持 --dataset-preset 快速加载 data/<preset>/ 下的标准文件。
-        if args.dataset_preset:
-            preset = args.dataset_preset.strip().lower()
-            preset_root = os.path.join(project_root, "data", preset)
-            if not os.path.isdir(preset_root):
-                raise ValueError(f"未找到数据预设目录: {preset_root}")
-            args.edges_path = args.edges_path or os.path.join(preset_root, "edges.csv")
-            args.features_path = args.features_path or os.path.join(preset_root, "features.csv")
-            args.labels_path = args.labels_path or os.path.join(preset_root, "labels.csv")
-            default_attr_updates = os.path.join(preset_root, "attr_updates.csv")
-            if args.attr_updates_path:
-                pass
-            elif os.path.exists(default_attr_updates):
-                args.attr_updates_path = default_attr_updates
-
-        if not args.edges_path:
-            raise ValueError("file 模式下必须提供 --edges-path")
+        args.edges_path, args.features_path, args.labels_path, args.attr_updates_path = _resolve_oag_dataset_paths(project_root)
         adj, attrs, labels, batches, node_to_idx = build_graph_from_files(
             edges_path=args.edges_path,
             features_path=args.features_path,
@@ -919,19 +1104,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
             seed=args.seed,
         )
 
-    # 初始化 EDANE 核心模型。
-    model = EDANE(
-        dim=args.dim,
-        order=args.order,
-        projection_density=args.projection_density,
-        learning_rate=args.learning_rate,
-        quantize=args.quantize,
-        binary_quantize=args.binary_quantize,
-        random_state=args.seed,
-        use_attr_fusion=not args.no_attr,
-        use_hyperbolic_fusion=not args.no_hyperbolic,
-        backend=args.backend,
-    )
+    # 初始化嵌入模型。
+    model = build_model(args)
 
     start = time.perf_counter()
     model.fit(adj, attrs)
@@ -946,10 +1120,17 @@ def run_pipeline(args: argparse.Namespace) -> None:
         logreg_epochs=args.logreg_epochs,
         logreg_lr=args.logreg_lr,
         logreg_weight_decay=args.logreg_weight_decay,
+        eval_protocol=args.eval_protocol,
+        eval_repeats=args.eval_repeats,
+        eval_train_ratio=args.eval_train_ratio,
+        label_cleanup_mode=args.label_cleanup_mode,
+        min_class_support=args.min_class_support,
+        logreg_class_weight=args.logreg_class_weight,
     )
     metrics_rows = [
         {
             "snapshot": 0,
+            "model": args.model,
             "update_latency_ms": init_latency_ms,
             **metrics0,
         }
@@ -1003,10 +1184,17 @@ def run_pipeline(args: argparse.Namespace) -> None:
             logreg_epochs=args.logreg_epochs,
             logreg_lr=args.logreg_lr,
             logreg_weight_decay=args.logreg_weight_decay,
+            eval_protocol=args.eval_protocol,
+            eval_repeats=args.eval_repeats,
+            eval_train_ratio=args.eval_train_ratio,
+            label_cleanup_mode=args.label_cleanup_mode,
+            min_class_support=args.min_class_support,
+            logreg_class_weight=args.logreg_class_weight,
         )
         metrics_rows.append(
                 {
                     "snapshot": i,
+                    "model": args.model,
                     "update_latency_ms": latency_ms,
                     "compute_update_latency_ms": compute_latency_ms,
                     "simulated_wait_ms": wait_ms,
@@ -1030,16 +1218,29 @@ def run_pipeline(args: argparse.Namespace) -> None:
             f,
             fieldnames=[
                 "snapshot",
+                "model",
                 "update_latency_ms",
                 "compute_update_latency_ms",
                 "simulated_wait_ms",
                 "batch_events",
                 "macro_f1",
+                "macro_f1_std",
                 "micro_f1",
+                "micro_f1_std",
                 "link_auc",
                 "link_ap",
                 "reconstruction_auc",
+                "labeled_nodes_raw",
                 "labeled_nodes",
+                "eval_dropped_labeled_nodes",
+                "eval_class_count_raw",
+                "eval_class_count",
+                "eval_dropped_class_count",
+                "label_cleanup_mode",
+                "min_class_support",
+                "f1_eval_repeats",
+                "f1_eval_successful_repeats",
+                "f1_eval_protocol",
             ],
         )
         writer.writeheader()
@@ -1054,15 +1255,36 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
     compression_ratio = float(getattr(model, "quantization_compression_ratio_", 1.0))
 
+    effective_quantize, effective_binary_quantize = _quantization_enabled_for_model(args)
+
     summary = {
         "mode": args.mode,
-        "dataset_preset": args.dataset_preset if args.mode == "file" else "synthetic",
+        "dataset": "OAG" if args.mode == "file" else "synthetic",
+        "dataset_source_url": "https://open.aminer.cn/open/article?id=67aaf63af4cbd12984b6a5f0" if args.mode == "file" else "",
+        "model": args.model,
+        "implementation_fidelity": "native" if args.model == "edane" else "paper_approximation",
         "snapshot_mode": args.snapshot_mode,
         "seed": int(args.seed),
         "classifier": args.classifier,
+        "logreg_class_weight": args.logreg_class_weight,
+        "f1_eval_protocol": args.eval_protocol,
+        "f1_eval_protocol_used": str(metrics_rows[-1]["f1_eval_protocol"]),
+        "f1_eval_repeats": int(args.eval_repeats if args.eval_protocol == "repeated_stratified" else 1),
+        "f1_eval_successful_repeats": int(metrics_rows[-1]["f1_eval_successful_repeats"]),
+        "f1_eval_train_ratio": float(args.eval_train_ratio),
+        "label_cleanup_mode": args.label_cleanup_mode,
+        "min_class_support": int(args.min_class_support),
+        "final_labeled_nodes_raw": float(metrics_rows[-1]["labeled_nodes_raw"]),
+        "final_labeled_nodes": float(metrics_rows[-1]["labeled_nodes"]),
+        "final_eval_dropped_labeled_nodes": float(metrics_rows[-1]["eval_dropped_labeled_nodes"]),
+        "final_eval_class_count_raw": float(metrics_rows[-1]["eval_class_count_raw"]),
+        "final_eval_class_count": float(metrics_rows[-1]["eval_class_count"]),
+        "final_eval_dropped_class_count": float(metrics_rows[-1]["eval_dropped_class_count"]),
         "backend": args.backend,
-        "quantize": bool(args.quantize),
-        "binary_quantize": bool(args.binary_quantize),
+        "supports_incremental_updates": bool(getattr(model, "supports_incremental_updates_", False)),
+        "online_update_mode": str(getattr(model, "online_update_mode_", "unknown")),
+        "quantize": effective_quantize,
+        "binary_quantize": effective_binary_quantize,
         "num_nodes": int(final_embedding.shape[0]),
         "feature_dim": int(attrs.shape[1]),
         "embedding_dim": int(final_embedding.shape[1]),
@@ -1073,7 +1295,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
         "avg_pacing_wait_ms": float(np.mean(pacing_waits)) if pacing_waits else 0.0,
         "p95_update_latency_ms": float(np.percentile(update_latencies, 95)) if update_latencies else 0.0,
         "final_macro_f1": float(metrics_rows[-1]["macro_f1"]),
+        "final_macro_f1_std": float(metrics_rows[-1]["macro_f1_std"]),
         "final_micro_f1": float(metrics_rows[-1]["micro_f1"]),
+        "final_micro_f1_std": float(metrics_rows[-1]["micro_f1_std"]),
         "final_link_auc": float(metrics_rows[-1]["link_auc"]),
         "final_link_ap": float(metrics_rows[-1]["link_ap"]),
         "final_reconstruction_auc": float(metrics_rows[-1]["reconstruction_auc"]),
@@ -1096,7 +1320,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     # 自动追加到项目根目录的 all_results.csv 汇总表。
     _append_to_all_results(project_root, tag, summary)
 
-    print("EDANE 全流程实验完成")
+    print(f"{args.model.upper()} 全流程实验完成")
     print("=" * 50)
     for k, v in summary.items():
         print(f"{k}: {v}")
@@ -1108,15 +1332,10 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     """构建命令行参数。"""
-    parser = argparse.ArgumentParser(description="EDANE 端到端实验流水线")
+    parser = argparse.ArgumentParser(description="动态图嵌入端到端实验流水线")
     parser.add_argument("--mode", choices=["synthetic", "file"], default="synthetic")
     parser.add_argument("--output-dir", type=str, default="")
-
-    parser.add_argument("--edges-path", type=str, default="")
-    parser.add_argument("--features-path", type=str, default="")
-    parser.add_argument("--labels-path", type=str, default="")
-    parser.add_argument("--attr-updates-path", type=str, default="")
-    parser.add_argument("--dataset-preset", type=str, default="")
+    parser.add_argument("--model", choices=["edane", "dane", "dtformer"], default="edane")
     parser.add_argument("--snapshots", type=int, default=8)
     parser.add_argument("--snapshot-mode", choices=["window", "cumulative"], default="window")
     parser.add_argument(
@@ -1130,6 +1349,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--order", type=int, default=2)
     parser.add_argument("--projection-density", type=float, default=0.12)
     parser.add_argument("--learning-rate", type=float, default=0.55)
+    parser.add_argument("--dane-attr-topk", type=int, default=20)
+    parser.add_argument("--dane-similarity-block-size", type=int, default=512)
+    parser.add_argument("--dane-perturbation-rank", type=int, default=64)
+    parser.add_argument("--dtformer-patch-size", type=int, default=2)
+    parser.add_argument("--dtformer-history-snapshots", type=int, default=8)
+    parser.add_argument("--dtformer-hidden-dim", type=int, default=96)
+    parser.add_argument("--dtformer-attention-temperature", type=float, default=1.0)
     parser.add_argument("--update-rate", type=int, default=0, help="目标变化速率（次/秒）；0 表示不进行速率控制")
     parser.add_argument("--quantize", action="store_true")
     parser.add_argument("--binary-quantize", action="store_true")
@@ -1139,6 +1365,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--classifier", choices=["centroid", "logreg"], default="logreg")
     parser.add_argument(
+        "--eval-protocol",
+        choices=["single_random", "repeated_stratified"],
+        default="repeated_stratified",
+        help="节点分类评估协议：单次随机切分或重复分层切分",
+    )
+    parser.add_argument("--eval-repeats", type=int, default=10, help="重复分层评估次数（single_random 模式下忽略）")
+    parser.add_argument("--eval-train-ratio", type=float, default=0.7, help="分类评估训练集比例")
+    parser.add_argument(
+        "--label-cleanup-mode",
+        choices=["off", "eval_only"],
+        default="off",
+        help="评估前标签清洗模式：off 保持原始标签，eval_only 仅在 F1 评估时过滤低支持类别",
+    )
+    parser.add_argument("--min-class-support", type=int, default=5, help="评估时保留类别的最小样本数（建议 >= 2）")
+    parser.add_argument(
         "--backend",
         choices=["numpy", "torch"],
         default="numpy",
@@ -1147,6 +1388,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--logreg-epochs", type=int, default=260)
     parser.add_argument("--logreg-lr", type=float, default=0.35)
     parser.add_argument("--logreg-weight-decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--logreg-class-weight",
+        choices=["none", "balanced"],
+        default="none",
+        help="逻辑回归分类头的类别权重策略；balanced 按训练折类别频次做反比加权",
+    )
 
     parser.add_argument("--synthetic-nodes", type=int, default=600)
     parser.add_argument("--synthetic-classes", type=int, default=6)

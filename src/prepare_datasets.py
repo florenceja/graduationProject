@@ -1,15 +1,11 @@
-"""数据整理脚本：将原始大数据集转换为 EDANE 实验输入格式。
+"""OAG 数据转换与校验脚本。
 
-输出到项目根目录下的 data/<preset>/
+当前项目的 file 模式固定使用 `dataset/OAG/` 作为真实数据输入目录。
+本脚本负责两类工作：
+1) 将 `dataset/OAG/v5_oag_publication_*.zip` 转换为当前流水线可直接消费的 CSV；
+2) 检查 `dataset/OAG/` 是否已按统一 CSV 格式放置完成。
 
-已支持的预设：
-- reddit_sample    — Reddit 社交网络子图
-- amazon2m_sample  — Amazon-2M 商品网络子图
-- amazon3m_sample  — Amazon-3M 商品标签共现图
-- mag_sample       — MAG 学术引用网络子图
-- twitter_sample   — Twitter 社交网络子图
-
-输出文件规范：
+必需文件：
 - edges.csv  (src, dst, time)
 - features.csv  (node_id, f1...fN)
 - labels.csv  (node_id, label)
@@ -18,14 +14,18 @@
 
 import argparse
 import csv
+import glob
 import gzip
 import hashlib
 import json
 import os
 import re
+import sqlite3
 import tarfile
+import tempfile
+import zipfile
 from collections import Counter, defaultdict
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -50,6 +50,303 @@ def source_root() -> str:
 def project_root() -> str:
     """当前项目根目录（src/ 的上一级）。"""
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def oag_dataset_dir() -> str:
+    return os.path.join(project_root(), "dataset", "OAG")
+
+
+def validate_oag_dataset(dataset_dir: Optional[str] = None) -> str:
+    dataset_dir = dataset_dir or oag_dataset_dir()
+    if not os.path.isdir(dataset_dir):
+        raise ValueError(f"未找到固定数据集目录: {dataset_dir}")
+    required_files = ["edges.csv", "features.csv", "labels.csv"]
+    missing = [name for name in required_files if not os.path.isfile(os.path.join(dataset_dir, name))]
+    if missing:
+        raise ValueError(f"dataset/OAG 缺少必需文件: {', '.join(missing)}")
+    return dataset_dir
+
+
+def _normalize_venue(raw: object) -> str:
+    text = str(raw or "").strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def _coerce_year(raw: object) -> Optional[int]:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if text == "":
+        return None
+    try:
+        year = int(float(text))
+    except ValueError:
+        return None
+    if year < 1000 or year > 2100:
+        return None
+    return year
+
+
+def _stringify_keywords(raw: object) -> str:
+    if isinstance(raw, list):
+        parts = [str(item).strip() for item in raw if str(item).strip()]
+        return " ".join(parts)
+    return str(raw or "").strip()
+
+
+def _discover_oag_archives(input_glob: str) -> List[str]:
+    paths = sorted(glob.glob(input_glob))
+    if not paths:
+        raise ValueError(f"未找到 OAG 压缩包，匹配模式: {input_glob}")
+    return paths
+
+
+def _iter_oag_records(
+    zip_paths: Sequence[str],
+    fail_on_malformed: bool = False,
+    max_record_bytes: int = 4_000_000,
+) -> Iterable[Tuple[dict, str, int]]:
+    for zip_path in zip_paths:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            json_members = [name for name in zf.namelist() if name.lower().endswith(".json")]
+            if not json_members:
+                raise ValueError(f"压缩包内未找到 JSON 文件: {zip_path}")
+            for member in json_members:
+                with zf.open(member, "r") as f:
+                    for line_no, raw_line in enumerate(f, start=1):
+                        if not raw_line.strip():
+                            continue
+                        if max_record_bytes > 0 and len(raw_line) > max_record_bytes:
+                            continue
+                        try:
+                            obj = json.loads(raw_line)
+                        except json.JSONDecodeError:
+                            if fail_on_malformed:
+                                raise ValueError(f"JSON 解析失败: {zip_path}::{member}:{line_no}") from None
+                            continue
+                        if isinstance(obj, dict):
+                            yield obj, zip_path, line_no
+
+
+def _write_atomic_csv(final_path: str, header: Sequence[str], rows: Iterable[Sequence[object]]) -> None:
+    ensure_dir(os.path.dirname(final_path))
+    fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(final_path) + ".", suffix=".tmp", dir=os.path.dirname(final_path))
+    os.close(fd)
+    try:
+        with open(tmp_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+            for row in rows:
+                writer.writerow(row)
+        os.replace(tmp_path, final_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+
+def convert_oag_archives(
+    input_glob: str,
+    output_dir: str,
+    feature_dim: int = 128,
+    min_venue_support: int = 50,
+    max_papers: int = 0,
+    min_year: int = 0,
+    max_year: int = 0,
+    keep_unlabeled: bool = False,
+    include_attr_updates: bool = False,
+    overwrite: bool = False,
+    fail_on_malformed: bool = False,
+    dry_run: bool = False,
+    report_every: int = 100000,
+    max_record_bytes: int = 4_000_000,
+) -> Dict[str, int]:
+    zip_paths = _discover_oag_archives(input_glob)
+    ensure_dir(output_dir)
+    output_edges = os.path.join(output_dir, "edges.csv")
+    output_features = os.path.join(output_dir, "features.csv")
+    output_labels = os.path.join(output_dir, "labels.csv")
+    output_attr_updates = os.path.join(output_dir, "attr_updates.csv")
+
+    if not overwrite:
+        existing = [path for path in (output_edges, output_features, output_labels) if os.path.exists(path)]
+        if existing:
+            raise ValueError(f"目标 CSV 已存在，请使用 --overwrite 覆盖: {', '.join(existing)}")
+
+    stats: Counter[str] = Counter()
+    venue_counts: Counter[str] = Counter()
+    db_fd, db_path = tempfile.mkstemp(prefix="oag_meta_", suffix=".sqlite", dir=output_dir)
+    os.close(db_fd)
+    conn = sqlite3.connect(db_path)
+    feature_lookup = None
+    edge_src_lookup = None
+    edge_dst_lookup = None
+    try:
+        conn.execute("PRAGMA journal_mode = DELETE")
+        conn.execute("PRAGMA synchronous = OFF")
+        conn.execute("PRAGMA temp_store = MEMORY")
+        conn.execute(
+            "CREATE TABLE papers (paper_id TEXT PRIMARY KEY, year INTEGER NOT NULL, venue TEXT NOT NULL, kept INTEGER NOT NULL DEFAULT 0, label INTEGER NOT NULL DEFAULT -1)"
+        )
+
+        insert_sql = "INSERT OR IGNORE INTO papers(paper_id, year, venue) VALUES(?, ?, ?)"
+        batch: List[Tuple[str, int, str]] = []
+        inserted_papers = 0
+        for obj, _, _ in _iter_oag_records(
+            zip_paths,
+            fail_on_malformed=fail_on_malformed,
+            max_record_bytes=max_record_bytes,
+        ):
+            stats["records_total"] += 1
+            paper_id = _safe_node_id(obj.get("id", ""))
+            if paper_id == "":
+                stats["missing_id"] += 1
+                continue
+            year = _coerce_year(obj.get("year"))
+            if year is None:
+                stats["missing_or_invalid_year"] += 1
+                continue
+            if min_year > 0 and year < min_year:
+                stats["year_filtered"] += 1
+                continue
+            if max_year > 0 and year > max_year:
+                stats["year_filtered"] += 1
+                continue
+
+            venue = _normalize_venue(obj.get("venue", ""))
+            if venue:
+                venue_counts[venue] += 1
+            else:
+                stats["missing_venue"] += 1
+
+            batch.append((paper_id, year, venue))
+            if len(batch) >= 5000:
+                before = conn.total_changes
+                conn.executemany(insert_sql, batch)
+                conn.commit()
+                inserted_papers += conn.total_changes - before
+                batch.clear()
+                if max_papers > 0 and inserted_papers >= max_papers:
+                    break
+            if report_every > 0 and stats["records_total"] % report_every == 0:
+                print(f"[OAG pass1] scanned {stats['records_total']} records...")
+
+        if batch and (max_papers <= 0 or inserted_papers < max_papers):
+            before = conn.total_changes
+            conn.executemany(insert_sql, batch)
+            conn.commit()
+            inserted_papers += conn.total_changes - before
+
+        stats["duplicate_ids"] = max(stats["records_total"] - stats["missing_id"] - stats["missing_or_invalid_year"] - stats["year_filtered"] - inserted_papers, 0)
+
+        if max_papers > 0 and inserted_papers > max_papers:
+            conn.execute(
+                "DELETE FROM papers WHERE paper_id NOT IN (SELECT paper_id FROM papers ORDER BY rowid LIMIT ?)",
+                (max_papers,),
+            )
+            conn.commit()
+
+        supported_venues = sorted([venue for venue, count in venue_counts.items() if count >= max(1, min_venue_support)])
+        venue_to_label = {venue: idx for idx, venue in enumerate(supported_venues)}
+        for venue, label in venue_to_label.items():
+            conn.execute("UPDATE papers SET kept=1, label=? WHERE venue=?", (label, venue))
+        if keep_unlabeled:
+            conn.execute("UPDATE papers SET kept=1 WHERE kept=0")
+        conn.commit()
+
+        stats["kept_papers"] = int(conn.execute("SELECT COUNT(*) FROM papers WHERE kept=1").fetchone()[0])
+        stats["supported_venues"] = len(venue_to_label)
+        stats["labeled_papers"] = int(conn.execute("SELECT COUNT(*) FROM papers WHERE kept=1 AND label>=0").fetchone()[0])
+        stats["unlabeled_kept_papers"] = int(conn.execute("SELECT COUNT(*) FROM papers WHERE kept=1 AND label<0").fetchone()[0])
+
+        if dry_run:
+            return dict(stats)
+
+        feature_lookup = conn.cursor()
+        edge_src_lookup = conn.cursor()
+        edge_dst_lookup = conn.cursor()
+
+        def iter_feature_rows() -> Iterable[Sequence[object]]:
+            written = 0
+            for obj, _, _ in _iter_oag_records(
+                zip_paths,
+                fail_on_malformed=fail_on_malformed,
+                max_record_bytes=max_record_bytes,
+            ):
+                paper_id = _safe_node_id(obj.get("id", ""))
+                row = feature_lookup.execute("SELECT kept FROM papers WHERE paper_id=?", (paper_id,)).fetchone()
+                if row is None or int(row[0]) != 1:
+                    continue
+                text_vec = _text_hash_features(
+                    str(obj.get("title", "") or ""),
+                    str(obj.get("abstract", "") or ""),
+                    _stringify_keywords(obj.get("keywords", [])),
+                    dim=feature_dim,
+                )
+                written += 1
+                yield [paper_id] + [float(v) for v in text_vec.tolist()]
+            stats["written_features"] = written
+
+        def iter_label_rows() -> Iterable[Sequence[object]]:
+            written = 0
+            for paper_id, label in conn.execute("SELECT paper_id, label FROM papers WHERE kept=1 ORDER BY paper_id"):
+                written += 1
+                yield [paper_id, label]
+            stats["written_labels"] = written
+
+        def iter_edge_rows() -> Iterable[Sequence[object]]:
+            written = 0
+            unresolved = 0
+            for obj, _, _ in _iter_oag_records(
+                zip_paths,
+                fail_on_malformed=fail_on_malformed,
+                max_record_bytes=max_record_bytes,
+            ):
+                src = _safe_node_id(obj.get("id", ""))
+                src_row = edge_src_lookup.execute("SELECT kept, year FROM papers WHERE paper_id=?", (src,)).fetchone()
+                if src_row is None or int(src_row[0]) != 1:
+                    continue
+                year = int(src_row[1])
+                refs = obj.get("references", [])
+                if not isinstance(refs, list):
+                    continue
+                local_seen = set()
+                for ref in refs:
+                    dst = _safe_node_id(ref)
+                    if dst == "" or dst == src or dst in local_seen:
+                        continue
+                    local_seen.add(dst)
+                    dst_row = edge_dst_lookup.execute("SELECT kept FROM papers WHERE paper_id=?", (dst,)).fetchone()
+                    if dst_row is None or int(dst_row[0]) != 1:
+                        unresolved += 1
+                        continue
+                    written += 1
+                    yield [src, dst, year]
+            stats["written_edges"] = written
+            stats["unresolved_references"] = unresolved
+
+        feature_header = ["node_id"] + [f"f{i + 1}" for i in range(feature_dim)]
+        _write_atomic_csv(output_features, feature_header, iter_feature_rows())
+        _write_atomic_csv(output_labels, ["node_id", "label"], iter_label_rows())
+        _write_atomic_csv(output_edges, ["src", "dst", "time"], iter_edge_rows())
+
+        if include_attr_updates:
+            _write_atomic_csv(output_attr_updates, ["time", "node_id"] + [f"f{i + 1}" for i in range(feature_dim)], [])
+            stats["written_attr_updates"] = 0
+        else:
+            _remove_if_exists(output_attr_updates)
+
+        validate_oag_dataset(output_dir)
+        return dict(stats)
+    finally:
+        for cursor in (feature_lookup, edge_src_lookup, edge_dst_lookup):
+            if cursor is not None:
+                cursor.close()
+        conn.close()
+        for cleanup_path in (db_path, db_path + "-wal", db_path + "-shm"):
+            if os.path.exists(cleanup_path):
+                os.remove(cleanup_path)
 
 
 def write_csv(path: str, header: Sequence[str], rows: Sequence[Sequence[object]]) -> None:
@@ -693,87 +990,54 @@ def prepare_amazon3m_sample(
 
 
 def main() -> None:
-    """命令行入口：可分别准备各数据集样本。"""
-    parser = argparse.ArgumentParser(description="将 D:/毕设资料/dataset 数据整理到当前实验目录")
-    parser.add_argument("--prepare-reddit", action="store_true")
-    parser.add_argument("--prepare-amazon", action="store_true")
-    parser.add_argument("--prepare-amazon3m", action="store_true")
-    parser.add_argument("--prepare-mag", action="store_true")
-    parser.add_argument("--prepare-twitter", action="store_true")
-    parser.add_argument("--reddit-max-nodes", type=int, default=15000)
-    parser.add_argument("--amazon-max-nodes", type=int, default=30000)
-    parser.add_argument("--amazon-max-edges", type=int, default=250000)
-    parser.add_argument("--amazon3m-max-nodes", type=int, default=10000)
-    parser.add_argument("--amazon3m-max-edges", type=int, default=200000)
-    parser.add_argument("--mag-max-nodes", type=int, default=8000)
-    parser.add_argument("--mag-max-edges", type=int, default=200000)
-    parser.add_argument("--twitter-max-nodes", type=int, default=12000)
-    parser.add_argument("--twitter-max-edges", type=int, default=180000)
-    parser.add_argument("--seed", type=int, default=42)
+    """命令行入口：转换或检查固定 OAG 数据目录。"""
+    parser = argparse.ArgumentParser(description="将 OAG publication zip 转换为固定 CSV，或检查 dataset/OAG 完整性")
+    parser.add_argument("--convert-oag", action="store_true", help="将 dataset/OAG/v5_oag_publication_*.zip 转换为 CSV")
+    parser.add_argument("--validate-only", action="store_true", help="仅检查 dataset/OAG/ 下 CSV 是否完整")
+    parser.add_argument("--dry-run", action="store_true", help="只扫描统计，不实际写出 CSV")
+    parser.add_argument("--overwrite", action="store_true", help="允许覆盖已存在的 OAG CSV 输出")
+    parser.add_argument("--fail-on-malformed", action="store_true", help="遇到损坏 JSON 行时直接失败")
+    parser.add_argument("--keep-unlabeled", action="store_true", help="保留未命中高频 venue 的论文，并在 labels.csv 中记为 -1")
+    parser.add_argument("--include-attr-updates", action="store_true", help="额外写出空的 attr_updates.csv 占位文件")
+    parser.add_argument("--feature-dim", type=int, default=128)
+    parser.add_argument("--min-venue-support", type=int, default=50)
+    parser.add_argument("--max-papers", type=int, default=0)
+    parser.add_argument("--min-year", type=int, default=0)
+    parser.add_argument("--max-year", type=int, default=0)
+    parser.add_argument("--report-every", type=int, default=100000)
+    parser.add_argument("--max-record-bytes", type=int, default=4000000, help="跳过超过该字节数的超大 JSON 行，避免内存峰值")
+    parser.add_argument("--input-glob", type=str, default=os.path.join(oag_dataset_dir(), "v5_oag_publication_*.zip"))
+    parser.add_argument("--output-dir", type=str, default=oag_dataset_dir())
     args = parser.parse_args()
 
-    any_flag = (
-        args.prepare_reddit or args.prepare_amazon or args.prepare_amazon3m
-        or args.prepare_mag or args.prepare_twitter
+    if args.validate_only or not args.convert_oag:
+        dataset_dir = validate_oag_dataset()
+        print("OAG 数据检查通过：")
+        print(dataset_dir)
+        print("必需文件：edges.csv, features.csv, labels.csv")
+        print("可选文件：attr_updates.csv")
+        if not args.convert_oag:
+            return
+
+    stats = convert_oag_archives(
+        input_glob=args.input_glob,
+        output_dir=args.output_dir,
+        feature_dim=args.feature_dim,
+        min_venue_support=args.min_venue_support,
+        max_papers=args.max_papers,
+        min_year=args.min_year,
+        max_year=args.max_year,
+        keep_unlabeled=args.keep_unlabeled,
+        include_attr_updates=args.include_attr_updates,
+        overwrite=args.overwrite,
+        fail_on_malformed=args.fail_on_malformed,
+        dry_run=args.dry_run,
+        report_every=args.report_every,
+        max_record_bytes=args.max_record_bytes,
     )
-    if not any_flag:
-        args.prepare_reddit = True
-        args.prepare_amazon = True
-        args.prepare_amazon3m = True
-        args.prepare_mag = True
-        args.prepare_twitter = True
-
-    outputs = []
-    if args.prepare_reddit:
-        outputs.append(("reddit_sample", prepare_reddit_sample(args.reddit_max_nodes, args.seed)))
-    if args.prepare_amazon:
-        outputs.append(
-            (
-                "amazon2m_sample",
-                prepare_amazon2m_sample(
-                    args.amazon_max_nodes,
-                    args.amazon_max_edges,
-                    args.seed,
-                ),
-            )
-        )
-    if args.prepare_mag:
-        outputs.append(
-            (
-                "mag_sample",
-                prepare_mag_sample(
-                    args.mag_max_nodes,
-                    args.mag_max_edges,
-                    args.seed,
-                ),
-            )
-        )
-    if args.prepare_twitter:
-        outputs.append(
-            (
-                "twitter_sample",
-                prepare_twitter_sample(
-                    args.twitter_max_nodes,
-                    args.twitter_max_edges,
-                    args.seed,
-                ),
-            )
-        )
-    if args.prepare_amazon3m:
-        outputs.append(
-            (
-                "amazon3m_sample",
-                prepare_amazon3m_sample(
-                    args.amazon3m_max_nodes,
-                    args.amazon3m_max_edges,
-                    args.seed,
-                ),
-            )
-        )
-
-    print("数据整理完成：")
-    for name, path in outputs:
-        print(f"{name}: {path}")
+    print("OAG 转换完成：")
+    for key in sorted(stats):
+        print(f"{key}: {stats[key]}")
 
 
 if __name__ == "__main__":
