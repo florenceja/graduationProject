@@ -4,7 +4,8 @@
 
 当前仓库的真实数据工作流已经收敛为：
 
-- 原始/统一输入目录：`dataset/OAG/`
+- 原始 OAG 压缩包目录：`dataset/OAG/`
+- 统一 CSV 输入目录：`data/OAG/`
 - synthetic 模式：仅用于快速调试
 - 其他历史数据样本目录：不再作为当前开发目标
 
@@ -14,17 +15,17 @@
 |------|------|
 | `src/edane_full_pipeline.py` | 主流水线 |
 | `src/run_stage23_experiments.py` | 阶段2/3矩阵实验 |
-| `src/prepare_datasets.py` | 检查 `dataset/OAG/` 是否完整 |
+| `src/prepare_datasets.py` | 将 `dataset/OAG/` 原始 zip 转换并校验 `data/OAG/` |
 | `src/edane.py` | EDANE |
 | `src/dane.py` | DANE baseline |
 | `src/dtformer.py` | DTFormer-style baseline |
 
 ## 3. file 模式约定
 
-- file 模式固定解析 `dataset/OAG/edges.csv`
-- file 模式固定解析 `dataset/OAG/features.csv`
-- file 模式固定解析 `dataset/OAG/labels.csv`
-- 若存在 `dataset/OAG/attr_updates.csv`，则自动使用
+- file 模式固定解析 `data/OAG/edges.csv`
+- file 模式固定解析 `data/OAG/features.csv`
+- file 模式固定解析 `data/OAG/labels.csv`
+- 若存在 `data/OAG/attr_updates.csv`，则自动使用
 - 不再通过 `--dataset-preset` 选择数据集
 
 ## 4. 新增模型时的要求
@@ -39,7 +40,7 @@
 
 ## 5. 调试建议
 
-先检查 OAG 目录：
+先检查 OAG CSV 目录：
 
 ```bash
 python src/prepare_datasets.py

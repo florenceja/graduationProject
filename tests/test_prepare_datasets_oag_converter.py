@@ -28,6 +28,13 @@ prepare = _load_module("prepare_oag_module", "prepare_datasets.py")
 
 
 class TestPrepareDatasetsOagConverter(unittest.TestCase):
+    def test_resolve_oag_subset_profile_test(self) -> None:
+        profile = prepare.resolve_oag_subset_profile("test")
+        self.assertEqual(profile["max_papers"], 50000)
+        self.assertEqual(profile["feature_dim"], 128)
+        self.assertEqual(profile["min_venue_support"], 50)
+        self.assertEqual(profile["candidate_multiplier"], 3)
+
     def _read_csv(self, path: str):
         with open(path, "r", encoding="utf-8", newline="") as f:
             return list(csv.reader(f))
@@ -135,6 +142,53 @@ class TestPrepareDatasetsOagConverter(unittest.TestCase):
             )
 
             self.assertEqual(stats["kept_papers"], 2)
+
+    def test_dense_selection_keeps_more_edges_than_legacy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = os.path.join(tmpdir, "input")
+            legacy_dir = os.path.join(tmpdir, "legacy")
+            dense_dir = os.path.join(tmpdir, "dense")
+            os.makedirs(input_dir, exist_ok=True)
+            os.makedirs(legacy_dir, exist_ok=True)
+            os.makedirs(dense_dir, exist_ok=True)
+            self._write_zip(
+                os.path.join(input_dir, "v5_oag_publication_1.zip"),
+                "v5_oag_publication_1.json",
+                [
+                    {"id": "a1", "title": "A1", "abstract": "", "keywords": [], "year": 2020, "references": [], "venue": "kdd"},
+                    {"id": "a2", "title": "A2", "abstract": "", "keywords": [], "year": 2020, "references": [], "venue": "kdd"},
+                    {"id": "a3", "title": "A3", "abstract": "", "keywords": [], "year": 2020, "references": [], "venue": "kdd"},
+                    {"id": "a4", "title": "A4", "abstract": "", "keywords": [], "year": 2020, "references": [], "venue": "kdd"},
+                    {"id": "b1", "title": "B1", "abstract": "", "keywords": [], "year": 2021, "references": ["b2", "b3", "b4"], "venue": "kdd"},
+                    {"id": "b2", "title": "B2", "abstract": "", "keywords": [], "year": 2021, "references": ["b1", "b3", "b4"], "venue": "kdd"},
+                    {"id": "b3", "title": "B3", "abstract": "", "keywords": [], "year": 2021, "references": ["b1", "b2", "b4"], "venue": "kdd"},
+                    {"id": "b4", "title": "B4", "abstract": "", "keywords": [], "year": 2021, "references": ["b1", "b2", "b3"], "venue": "kdd"},
+                ],
+            )
+
+            legacy_stats = prepare.convert_oag_archives(
+                input_glob=os.path.join(input_dir, "v5_oag_publication_*.zip"),
+                output_dir=legacy_dir,
+                feature_dim=8,
+                min_venue_support=1,
+                max_papers=4,
+                overwrite=True,
+                selection_strategy="legacy",
+            )
+            dense_stats = prepare.convert_oag_archives(
+                input_glob=os.path.join(input_dir, "v5_oag_publication_*.zip"),
+                output_dir=dense_dir,
+                feature_dim=8,
+                min_venue_support=1,
+                max_papers=4,
+                overwrite=True,
+                selection_strategy="dense",
+                candidate_multiplier=2,
+            )
+
+            self.assertEqual(legacy_stats["kept_papers"], 4)
+            self.assertEqual(dense_stats["kept_papers"], 4)
+            self.assertGreater(dense_stats["written_edges"], legacy_stats["written_edges"])
 
 
 if __name__ == "__main__":

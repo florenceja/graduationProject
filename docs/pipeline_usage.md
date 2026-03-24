@@ -3,13 +3,13 @@
 ## 1. 当前约束
 
 - `--mode synthetic`：仍用于快速自检。
-- `--mode file`：**固定且仅使用** `dataset/OAG/`。
+- `--mode file`：**固定且仅使用** `data/OAG/`。
 - 其他历史样本数据集（Reddit、Amazon、MAG、Twitter）**不再作为当前实验范围**。
 
 固定数据目录要求：
 
 ```text
-dataset/
+data/
 └── OAG/
     ├── edges.csv
     ├── features.csv
@@ -36,7 +36,7 @@ dataset/
 |------|------|------|
 | 实验主脚本 | `src/edane_full_pipeline.py` | 端到端实验流水线 |
 | 阶段2/3矩阵脚本 | `src/run_stage23_experiments.py` | 批量运行更新频率与消融实验 |
-| 数据检查脚本 | `src/prepare_datasets.py` | 检查 `dataset/OAG/` 是否满足输入要求 |
+| 数据检查脚本 | `src/prepare_datasets.py` | 将 `dataset/OAG/` 原始 zip 转为 `data/OAG/` CSV，并检查输入是否完整 |
 
 ## 3. 运行方式
 
@@ -48,13 +48,20 @@ python src/edane_full_pipeline.py --mode synthetic --quantize
 
 ### 3.2 OAG 文件模式
 
-如果 `dataset/OAG/` 下还是原始 `v5_oag_publication_*.zip`，先转换：
+如果 `dataset/OAG/` 下有原始 `v5_oag_publication_*.zip`，先转换到 `data/OAG/`：
 
 ```bash
-python src/prepare_datasets.py --convert-oag --overwrite
+python src/prepare_datasets.py --convert-oag --subset-profile test --overwrite
 ```
 
-如果只检查固定数据目录：
+常用 profile：
+
+- `test`：本机测试算法，优先可跑性
+- `small`：更大一些的对比实验子集
+- `medium`：更接近正式实验的数据量
+- `full`：尝试全量 OAG 转换
+
+如果只检查固定 CSV 目录：
 
 ```bash
 python src/prepare_datasets.py --validate-only
@@ -65,6 +72,20 @@ python src/prepare_datasets.py --validate-only
 ```bash
 python src/prepare_datasets.py --convert-oag --overwrite --max-record-bytes 2000000
 ```
+
+如果换到更强硬件上尝试全量 OAG：
+
+```bash
+python src/prepare_datasets.py --convert-oag --subset-profile full --overwrite
+```
+
+建议环境：
+
+- 128GB 及以上内存
+- NVMe SSD
+- 长时间稳定运行环境（服务器/工作站）
+
+注意：全量转换 ≠ 当前主流水线就能直接全量训练。主流水线仍会整读 CSV，通常还需要结合 `--max-nodes` 或后续采样。
 
 然后运行主流水线：
 
@@ -129,5 +150,5 @@ time,node_id,f1,f2,f3
 ## 6. 当前说明
 
 - file 模式不再接受 `--dataset-preset`。
-- file 模式不再按 `data/<preset>/` 查找输入。
-- 后续真实实验统一按 `dataset/OAG/` 组织与运行。
+- file 模式固定读取 `data/OAG/`。
+- `dataset/OAG/` 仅作为原始 OAG zip 存放目录。

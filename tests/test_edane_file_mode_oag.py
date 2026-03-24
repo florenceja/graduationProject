@@ -28,12 +28,12 @@ stage23 = _load_module("stage23_oag_module", "run_stage23_experiments.py")
 class TestEdaneFileModeOag(unittest.TestCase):
     def test_resolve_oag_dataset_paths_requires_fixed_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            with self.assertRaisesRegex(ValueError, "dataset/OAG"):
+            with self.assertRaisesRegex(ValueError, "data/OAG"):
                 pipeline._resolve_oag_dataset_paths(tmpdir)
 
     def test_resolve_oag_dataset_paths_returns_required_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            oag_dir = os.path.join(tmpdir, "dataset", "OAG")
+            oag_dir = os.path.join(tmpdir, "data", "OAG")
             os.makedirs(oag_dir, exist_ok=True)
             for name in ["edges.csv", "features.csv", "labels.csv"]:
                 with open(os.path.join(oag_dir, name), "w", encoding="utf-8") as f:

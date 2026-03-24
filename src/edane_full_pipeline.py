@@ -966,11 +966,11 @@ def _build_run_tag(args: argparse.Namespace) -> str:
 
 def _resolve_oag_dataset_paths(project_root: str) -> tuple[str, str, str, str]:
     """Resolve the fixed OAG dataset directory for file-mode experiments."""
-    dataset_root = os.path.join(project_root, "dataset", "OAG")
+    dataset_root = os.path.join(project_root, "data", "OAG")
     if not os.path.isdir(dataset_root):
         raise ValueError(
-            f"file 模式固定使用 dataset/OAG，但未找到目录: {dataset_root}。"
-            "请先将 OAG 数据放到 dataset/OAG/ 下。"
+            f"file 模式固定使用 data/OAG，但未找到目录: {dataset_root}。"
+            "请先将 OAG CSV 数据放到 data/OAG/ 下。"
         )
 
     edges_path = os.path.join(dataset_root, "edges.csv")
@@ -981,7 +981,7 @@ def _resolve_oag_dataset_paths(project_root: str) -> tuple[str, str, str, str]:
     missing = [path for path in required if not os.path.isfile(path)]
     if missing:
         missing_text = ", ".join(missing)
-        raise ValueError(f"dataset/OAG 缺少必需文件: {missing_text}")
+        raise ValueError(f"data/OAG 缺少必需文件: {missing_text}")
     return edges_path, features_path, labels_path, attr_updates_path if os.path.isfile(attr_updates_path) else ""
 
 

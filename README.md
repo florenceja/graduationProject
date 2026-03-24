@@ -26,8 +26,11 @@
 │   ├── pipeline_usage.md         流水线详细用法
 │   └── modules_1_4_integrated.md 模块一至模块四整合文档
 │
-├── dataset/                      项目内真实数据目录
-│   └── OAG/                      固定数据集目录（后续 file 模式仅使用它）
+├── dataset/                      项目内原始 OAG 压缩包目录
+│   └── OAG/                      存放 v5_oag_publication_*.zip
+│
+├── data/                         流水线实际使用的数据目录
+│   └── OAG/                      固定 CSV 数据集目录（file 模式读取这里）
 │
 ├── src/                          源代码
 │   ├── edane.py                  算法核心
@@ -42,8 +45,8 @@
 
 补充约定：
 
-- 当前 file 模式固定使用项目根目录下的 `dataset/OAG/`；
-- `prepare_datasets.py` 现在既支持把 OAG zip 转成统一 CSV，也支持检查 `dataset/OAG/` 是否满足输入要求；
+- 当前 file 模式固定使用项目根目录下的 `data/OAG/`；
+- `dataset/OAG/` 仅保留 OAG 原始 zip，`prepare_datasets.py` 会将其转换到 `data/OAG/`；
 - `dataset/` 与 `outputs/` 现在按本地数据/本地实验产物管理，不建议直接当作远程仓库正文提交。
 
 数据来源说明：
@@ -68,10 +71,13 @@ OAG 转换口径说明：
 # 1. 安装依赖
 pip install -r requirements.txt
 
-# 2. 将 OAG 原始 zip 转成固定 CSV（首次）
-python src/prepare_datasets.py --convert-oag --overwrite
+# 2. 本机先生成可跑子集（推荐）
+python src/prepare_datasets.py --convert-oag --subset-profile test --overwrite
 
-# 或仅检查固定数据集 dataset/OAG
+# 如需更大子集
+python src/prepare_datasets.py --convert-oag --subset-profile small --overwrite
+
+# 或仅检查固定数据集 data/OAG
 python src/prepare_datasets.py --validate-only
 
 # 3. 运行实验
@@ -112,6 +118,20 @@ python src/run_stage23_experiments.py --mode file --snapshots 3 --max-nodes 3000
 # 快速自检（synthetic）
 python src/run_stage23_experiments.py --mode synthetic --snapshots 2 --stage2-rates 10,100 --synthetic-rounds 6
 ```
+
+## 全量 OAG 运行建议
+
+如果你要尝试全量 OAG，请使用：
+
+```bash
+python src/prepare_datasets.py --convert-oag --subset-profile full --overwrite
+```
+
+但要注意：
+
+- 这更适合高内存/长时间任务环境，不适合普通开发机；
+- 建议至少使用 **128GB+ 内存、NVMe SSD、长时可持续运行环境**；
+- 即使转换完成，当前 `edane_full_pipeline.py` 仍会整读 CSV，因此全量 OAG 主流水线通常还需要进一步做图采样或 `--max-nodes` 限制。
 
 输出在 `outputs/stage23_matrix_oag_<timestamp>/`：
 

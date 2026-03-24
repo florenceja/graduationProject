@@ -1,9 +1,9 @@
 """OAG 数据转换与校验脚本。
 
-当前项目的 file 模式固定使用 `dataset/OAG/` 作为真实数据输入目录。
+当前项目的 file 模式固定使用 `data/OAG/` 作为真实数据输入目录。
 本脚本负责两类工作：
 1) 将 `dataset/OAG/v5_oag_publication_*.zip` 转换为当前流水线可直接消费的 CSV；
-2) 检查 `dataset/OAG/` 是否已按统一 CSV 格式放置完成。
+2) 检查 `data/OAG/` 是否已按统一 CSV 格式放置完成。
 
 必需文件：
 - edges.csv  (src, dst, time)
@@ -53,6 +53,10 @@ def project_root() -> str:
 
 
 def oag_dataset_dir() -> str:
+    return os.path.join(project_root(), "data", "OAG")
+
+
+def oag_raw_dir() -> str:
     return os.path.join(project_root(), "dataset", "OAG")
 
 
@@ -63,7 +67,7 @@ def validate_oag_dataset(dataset_dir: Optional[str] = None) -> str:
     required_files = ["edges.csv", "features.csv", "labels.csv"]
     missing = [name for name in required_files if not os.path.isfile(os.path.join(dataset_dir, name))]
     if missing:
-        raise ValueError(f"dataset/OAG 缺少必需文件: {', '.join(missing)}")
+        raise ValueError(f"data/OAG 缺少必需文件: {', '.join(missing)}")
     return dataset_dir
 
 
@@ -100,6 +104,19 @@ def _discover_oag_archives(input_glob: str) -> List[str]:
     if not paths:
         raise ValueError(f"未找到 OAG 压缩包，匹配模式: {input_glob}")
     return paths
+
+
+def resolve_oag_subset_profile(profile: str) -> Dict[str, int]:
+    normalized = str(profile or "custom").strip().lower()
+    if normalized == "test":
+        return {"max_papers": 50000, "feature_dim": 128, "min_venue_support": 50, "max_record_bytes": 2_000_000, "candidate_multiplier": 3}
+    if normalized == "small":
+        return {"max_papers": 200000, "feature_dim": 128, "min_venue_support": 100, "max_record_bytes": 2_000_000, "candidate_multiplier": 3}
+    if normalized == "medium":
+        return {"max_papers": 1000000, "feature_dim": 128, "min_venue_support": 200, "max_record_bytes": 2_000_000, "candidate_multiplier": 2}
+    if normalized == "full":
+        return {"max_papers": 0, "feature_dim": 128, "min_venue_support": 500, "max_record_bytes": 2_000_000, "candidate_multiplier": 2}
+    return {"max_papers": 0, "feature_dim": 128, "min_venue_support": 50, "max_record_bytes": 4_000_000, "candidate_multiplier": 2}
 
 
 def _iter_oag_records(
@@ -161,6 +178,8 @@ def convert_oag_archives(
     dry_run: bool = False,
     report_every: int = 100000,
     max_record_bytes: int = 4_000_000,
+    selection_strategy: str = "dense",
+    candidate_multiplier: int = 2,
 ) -> Dict[str, int]:
     zip_paths = _discover_oag_archives(input_glob)
     ensure_dir(output_dir)
@@ -187,12 +206,21 @@ def convert_oag_archives(
         conn.execute("PRAGMA synchronous = OFF")
         conn.execute("PRAGMA temp_store = MEMORY")
         conn.execute(
-            "CREATE TABLE papers (paper_id TEXT PRIMARY KEY, year INTEGER NOT NULL, venue TEXT NOT NULL, kept INTEGER NOT NULL DEFAULT 0, label INTEGER NOT NULL DEFAULT -1)"
+            "CREATE TABLE papers (paper_id TEXT PRIMARY KEY, year INTEGER NOT NULL, venue TEXT NOT NULL, kept INTEGER NOT NULL DEFAULT 0, label INTEGER NOT NULL DEFAULT -1, outgoing_count INTEGER NOT NULL DEFAULT 0, incoming_count INTEGER NOT NULL DEFAULT 0, score REAL NOT NULL DEFAULT 0.0)"
         )
+        conn.execute("CREATE TABLE ref_counts (paper_id TEXT PRIMARY KEY, cnt INTEGER NOT NULL DEFAULT 0)")
 
-        insert_sql = "INSERT OR IGNORE INTO papers(paper_id, year, venue) VALUES(?, ?, ?)"
-        batch: List[Tuple[str, int, str]] = []
+        insert_sql = "INSERT OR IGNORE INTO papers(paper_id, year, venue, outgoing_count) VALUES(?, ?, ?, ?)"
+        ref_upsert_sql = "INSERT INTO ref_counts(paper_id, cnt) VALUES(?, 1) ON CONFLICT(paper_id) DO UPDATE SET cnt = cnt + 1"
+        batch: List[Tuple[str, int, str, int, List[str]]] = []
         inserted_papers = 0
+        selection_strategy = selection_strategy.strip().lower()
+        candidate_limit = 0
+        if max_papers > 0:
+            if selection_strategy == "legacy":
+                candidate_limit = max_papers
+            else:
+                candidate_limit = max(max_papers, max_papers * max(1, candidate_multiplier))
         for obj, _, _ in _iter_oag_records(
             zip_paths,
             fail_on_malformed=fail_on_malformed,
@@ -220,45 +248,135 @@ def convert_oag_archives(
             else:
                 stats["missing_venue"] += 1
 
-            batch.append((paper_id, year, venue))
-            if len(batch) >= 5000:
-                before = conn.total_changes
-                conn.executemany(insert_sql, batch)
+            refs = obj.get("references", [])
+            outgoing_count = len(refs) if isinstance(refs, list) else 0
+
+            normalized_refs: List[str] = []
+            if isinstance(refs, list):
+                for ref in refs:
+                    dst = _safe_node_id(ref)
+                    if dst and dst != paper_id:
+                        normalized_refs.append(dst)
+            batch.append((paper_id, year, venue, outgoing_count, normalized_refs))
+            should_flush = len(batch) >= 5000 or (candidate_limit > 0 and inserted_papers + len(batch) >= candidate_limit)
+            if should_flush:
+                if candidate_limit > 0 and inserted_papers + len(batch) > candidate_limit:
+                    keep = max(candidate_limit - inserted_papers, 0)
+                    batch = batch[:keep]
+                insert_rows = [(paper_id, year, venue, outgoing_count) for paper_id, year, venue, outgoing_count, _ in batch]
+                ref_batch = [(dst,) for _, _, _, _, refs_list in batch for dst in refs_list]
+                before = int(conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0])
+                conn.executemany(insert_sql, insert_rows)
+                if ref_batch:
+                    conn.executemany(ref_upsert_sql, ref_batch)
                 conn.commit()
-                inserted_papers += conn.total_changes - before
+                after = int(conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0])
+                inserted_papers += after - before
                 batch.clear()
-                if max_papers > 0 and inserted_papers >= max_papers:
+                if candidate_limit > 0 and inserted_papers >= candidate_limit:
                     break
             if report_every > 0 and stats["records_total"] % report_every == 0:
                 print(f"[OAG pass1] scanned {stats['records_total']} records...")
 
-        if batch and (max_papers <= 0 or inserted_papers < max_papers):
-            before = conn.total_changes
-            conn.executemany(insert_sql, batch)
+        if batch and (candidate_limit <= 0 or inserted_papers < candidate_limit):
+            insert_rows = [(paper_id, year, venue, outgoing_count) for paper_id, year, venue, outgoing_count, _ in batch]
+            ref_batch = [(dst,) for _, _, _, _, refs_list in batch for dst in refs_list]
+            before = int(conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0])
+            conn.executemany(insert_sql, insert_rows)
+            if ref_batch:
+                conn.executemany(ref_upsert_sql, ref_batch)
             conn.commit()
-            inserted_papers += conn.total_changes - before
+            after = int(conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0])
+            inserted_papers += after - before
 
         stats["duplicate_ids"] = max(stats["records_total"] - stats["missing_id"] - stats["missing_or_invalid_year"] - stats["year_filtered"] - inserted_papers, 0)
-
-        if max_papers > 0 and inserted_papers > max_papers:
-            conn.execute(
-                "DELETE FROM papers WHERE paper_id NOT IN (SELECT paper_id FROM papers ORDER BY rowid LIMIT ?)",
-                (max_papers,),
-            )
-            conn.commit()
+        conn.execute(
+            "UPDATE papers SET incoming_count = COALESCE((SELECT cnt FROM ref_counts WHERE ref_counts.paper_id = papers.paper_id), 0)"
+        )
 
         supported_venues = sorted([venue for venue, count in venue_counts.items() if count >= max(1, min_venue_support)])
         venue_to_label = {venue: idx for idx, venue in enumerate(supported_venues)}
+        conn.execute("CREATE TABLE candidate_refs (src TEXT NOT NULL, dst TEXT NOT NULL)")
+
         for venue, label in venue_to_label.items():
-            conn.execute("UPDATE papers SET kept=1, label=? WHERE venue=?", (label, venue))
-        if keep_unlabeled:
-            conn.execute("UPDATE papers SET kept=1 WHERE kept=0")
+            conn.execute(
+                "UPDATE papers SET label=?, score=(incoming_count + 0.5 * outgoing_count + 5.0) WHERE venue=?",
+                (label, venue),
+            )
+        conn.execute(
+            "UPDATE papers SET score=(incoming_count + 0.5 * outgoing_count) WHERE label < 0"
+        )
+
+        if max_papers > 0 and selection_strategy == "dense":
+            candidate_pool = max(max_papers, max_papers * max(1, candidate_multiplier))
+            conn.execute("UPDATE papers SET kept=0")
+            if keep_unlabeled:
+                conn.execute(
+                    "UPDATE papers SET kept=1 WHERE paper_id IN (SELECT paper_id FROM papers ORDER BY score DESC, year DESC, paper_id ASC LIMIT ?)",
+                    (candidate_pool,),
+                )
+            else:
+                conn.execute(
+                    "UPDATE papers SET kept=1 WHERE paper_id IN (SELECT paper_id FROM papers WHERE label >= 0 ORDER BY score DESC, year DESC, paper_id ASC LIMIT ?)",
+                    (candidate_pool,),
+                )
+            conn.commit()
+
+            candidate_ids = {row[0] for row in conn.execute("SELECT paper_id FROM papers WHERE kept=1")}
+            remaining_candidate_ids = set(candidate_ids)
+            for obj, _, _ in _iter_oag_records(
+                zip_paths,
+                fail_on_malformed=fail_on_malformed,
+                max_record_bytes=max_record_bytes,
+            ):
+                src = _safe_node_id(obj.get("id", ""))
+                if src not in remaining_candidate_ids:
+                    continue
+                refs = obj.get("references", [])
+                if not isinstance(refs, list):
+                    remaining_candidate_ids.discard(src)
+                    continue
+                local_pairs = []
+                seen = set()
+                for ref in refs:
+                    dst = _safe_node_id(ref)
+                    if dst in candidate_ids and dst != src and dst not in seen:
+                        seen.add(dst)
+                        local_pairs.append((src, dst))
+                if local_pairs:
+                    conn.executemany("INSERT INTO candidate_refs(src, dst) VALUES(?, ?)", local_pairs)
+                remaining_candidate_ids.discard(src)
+                if not remaining_candidate_ids:
+                    break
+            conn.execute(
+                "UPDATE papers SET score = score + 2.0 * COALESCE((SELECT COUNT(*) FROM candidate_refs WHERE candidate_refs.src = papers.paper_id), 0) + 2.0 * COALESCE((SELECT COUNT(*) FROM candidate_refs WHERE candidate_refs.dst = papers.paper_id), 0)"
+            )
+            conn.execute("UPDATE papers SET kept=0")
+
+        if max_papers > 0:
+            if keep_unlabeled:
+                conn.execute(
+                    "UPDATE papers SET kept=1 WHERE paper_id IN (SELECT paper_id FROM papers ORDER BY score DESC, year DESC, paper_id ASC LIMIT ?)",
+                    (max_papers,),
+                )
+            else:
+                conn.execute(
+                    "UPDATE papers SET kept=1 WHERE paper_id IN (SELECT paper_id FROM papers WHERE label >= 0 ORDER BY score DESC, year DESC, paper_id ASC LIMIT ?)",
+                    (max_papers,),
+                )
+        else:
+            if keep_unlabeled:
+                conn.execute("UPDATE papers SET kept=1")
+            else:
+                conn.execute("UPDATE papers SET kept=1 WHERE label >= 0")
         conn.commit()
 
         stats["kept_papers"] = int(conn.execute("SELECT COUNT(*) FROM papers WHERE kept=1").fetchone()[0])
         stats["supported_venues"] = len(venue_to_label)
         stats["labeled_papers"] = int(conn.execute("SELECT COUNT(*) FROM papers WHERE kept=1 AND label>=0").fetchone()[0])
         stats["unlabeled_kept_papers"] = int(conn.execute("SELECT COUNT(*) FROM papers WHERE kept=1 AND label<0").fetchone()[0])
+        stats["candidate_papers"] = inserted_papers
+        kept_paper_ids = {row[0] for row in conn.execute("SELECT paper_id FROM papers WHERE kept=1")}
 
         if dry_run:
             return dict(stats)
@@ -269,14 +387,18 @@ def convert_oag_archives(
 
         def iter_feature_rows() -> Iterable[Sequence[object]]:
             written = 0
+            remaining_ids = set(kept_paper_ids)
             for obj, _, _ in _iter_oag_records(
                 zip_paths,
                 fail_on_malformed=fail_on_malformed,
                 max_record_bytes=max_record_bytes,
             ):
                 paper_id = _safe_node_id(obj.get("id", ""))
+                if paper_id not in remaining_ids:
+                    continue
                 row = feature_lookup.execute("SELECT kept FROM papers WHERE paper_id=?", (paper_id,)).fetchone()
                 if row is None or int(row[0]) != 1:
+                    remaining_ids.discard(paper_id)
                     continue
                 text_vec = _text_hash_features(
                     str(obj.get("title", "") or ""),
@@ -285,7 +407,10 @@ def convert_oag_archives(
                     dim=feature_dim,
                 )
                 written += 1
+                remaining_ids.discard(paper_id)
                 yield [paper_id] + [float(v) for v in text_vec.tolist()]
+                if not remaining_ids:
+                    break
             stats["written_features"] = written
 
         def iter_label_rows() -> Iterable[Sequence[object]]:
@@ -298,18 +423,23 @@ def convert_oag_archives(
         def iter_edge_rows() -> Iterable[Sequence[object]]:
             written = 0
             unresolved = 0
+            remaining_src_ids = set(kept_paper_ids)
             for obj, _, _ in _iter_oag_records(
                 zip_paths,
                 fail_on_malformed=fail_on_malformed,
                 max_record_bytes=max_record_bytes,
             ):
                 src = _safe_node_id(obj.get("id", ""))
+                if src not in remaining_src_ids:
+                    continue
                 src_row = edge_src_lookup.execute("SELECT kept, year FROM papers WHERE paper_id=?", (src,)).fetchone()
                 if src_row is None or int(src_row[0]) != 1:
+                    remaining_src_ids.discard(src)
                     continue
                 year = int(src_row[1])
                 refs = obj.get("references", [])
                 if not isinstance(refs, list):
+                    remaining_src_ids.discard(src)
                     continue
                 local_seen = set()
                 for ref in refs:
@@ -323,6 +453,9 @@ def convert_oag_archives(
                         continue
                     written += 1
                     yield [src, dst, year]
+                remaining_src_ids.discard(src)
+                if not remaining_src_ids:
+                    break
             stats["written_edges"] = written
             stats["unresolved_references"] = unresolved
 
@@ -991,14 +1124,17 @@ def prepare_amazon3m_sample(
 
 def main() -> None:
     """命令行入口：转换或检查固定 OAG 数据目录。"""
-    parser = argparse.ArgumentParser(description="将 OAG publication zip 转换为固定 CSV，或检查 dataset/OAG 完整性")
-    parser.add_argument("--convert-oag", action="store_true", help="将 dataset/OAG/v5_oag_publication_*.zip 转换为 CSV")
-    parser.add_argument("--validate-only", action="store_true", help="仅检查 dataset/OAG/ 下 CSV 是否完整")
+    parser = argparse.ArgumentParser(description="将 OAG publication zip 转换为固定 CSV，或检查 data/OAG 完整性")
+    parser.add_argument("--convert-oag", action="store_true", help="将 dataset/OAG/v5_oag_publication_*.zip 转换为 data/OAG CSV")
+    parser.add_argument("--validate-only", action="store_true", help="仅检查 data/OAG/ 下 CSV 是否完整")
     parser.add_argument("--dry-run", action="store_true", help="只扫描统计，不实际写出 CSV")
     parser.add_argument("--overwrite", action="store_true", help="允许覆盖已存在的 OAG CSV 输出")
     parser.add_argument("--fail-on-malformed", action="store_true", help="遇到损坏 JSON 行时直接失败")
     parser.add_argument("--keep-unlabeled", action="store_true", help="保留未命中高频 venue 的论文，并在 labels.csv 中记为 -1")
     parser.add_argument("--include-attr-updates", action="store_true", help="额外写出空的 attr_updates.csv 占位文件")
+    parser.add_argument("--subset-profile", choices=["custom", "test", "small", "medium", "full"], default="custom", help="快速套用 OAG 子集/全量转换参数")
+    parser.add_argument("--selection-strategy", choices=["dense", "legacy"], default="dense", help="dense 优先保留引用更活跃的论文；legacy 按旧的前缀截断逻辑")
+    parser.add_argument("--candidate-multiplier", type=int, default=2, help="dense 模式下候选池相对 max_papers 的倍数")
     parser.add_argument("--feature-dim", type=int, default=128)
     parser.add_argument("--min-venue-support", type=int, default=50)
     parser.add_argument("--max-papers", type=int, default=0)
@@ -1006,9 +1142,21 @@ def main() -> None:
     parser.add_argument("--max-year", type=int, default=0)
     parser.add_argument("--report-every", type=int, default=100000)
     parser.add_argument("--max-record-bytes", type=int, default=4000000, help="跳过超过该字节数的超大 JSON 行，避免内存峰值")
-    parser.add_argument("--input-glob", type=str, default=os.path.join(oag_dataset_dir(), "v5_oag_publication_*.zip"))
+    parser.add_argument("--input-glob", type=str, default=os.path.join(oag_raw_dir(), "v5_oag_publication_*.zip"))
     parser.add_argument("--output-dir", type=str, default=oag_dataset_dir())
     args = parser.parse_args()
+
+    profile_defaults = resolve_oag_subset_profile(args.subset_profile)
+    if args.max_papers == 0 and profile_defaults["max_papers"] > 0:
+        args.max_papers = profile_defaults["max_papers"]
+    if args.feature_dim == 128:
+        args.feature_dim = profile_defaults["feature_dim"]
+    if args.min_venue_support == 50:
+        args.min_venue_support = profile_defaults["min_venue_support"]
+    if args.max_record_bytes == 4000000:
+        args.max_record_bytes = profile_defaults["max_record_bytes"]
+    if args.candidate_multiplier == 2:
+        args.candidate_multiplier = profile_defaults["candidate_multiplier"]
 
     if args.validate_only or not args.convert_oag:
         dataset_dir = validate_oag_dataset()
@@ -1034,8 +1182,12 @@ def main() -> None:
         dry_run=args.dry_run,
         report_every=args.report_every,
         max_record_bytes=args.max_record_bytes,
+        selection_strategy=args.selection_strategy,
+        candidate_multiplier=args.candidate_multiplier,
     )
     print("OAG 转换完成：")
+    print(f"subset_profile: {args.subset_profile}")
+    print(f"selection_strategy: {args.selection_strategy}")
     for key in sorted(stats):
         print(f"{key}: {stats[key]}")
 

@@ -14,7 +14,13 @@ pip install torch
 
 ## 2. 准备 OAG 数据目录
 
-项目当前固定使用：
+项目当前 file 模式固定使用：
+
+```text
+data/OAG/
+```
+
+其中原始 OAG 压缩包保留在：
 
 ```text
 dataset/OAG/
@@ -34,10 +40,16 @@ dataset/OAG/
 
 - https://open.aminer.cn/open/article?id=67aaf63af4cbd12984b6a5f0
 
-如果当前目录里还是 `v5_oag_publication_*.zip` 原始包，先执行转换：
+如果当前目录里还是 `v5_oag_publication_*.zip` 原始包，先执行本机测试子集转换：
 
 ```bash
-python src/prepare_datasets.py --convert-oag --overwrite
+python src/prepare_datasets.py --convert-oag --subset-profile test --overwrite
+```
+
+如果换到更强设备并尝试全量转换：
+
+```bash
+python src/prepare_datasets.py --convert-oag --subset-profile full --overwrite
 ```
 
 如果只是检查 CSV 是否已就绪：
@@ -94,5 +106,5 @@ run_all.bat
 
 ## 6. 当前范围
 
-- 当前项目的真实数据实验只考虑 `dataset/OAG/`
+- 当前项目的真实数据实验只考虑 `data/OAG/`
 - 其他历史样本数据集不再作为当前工作流的一部分
