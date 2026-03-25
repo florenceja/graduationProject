@@ -20,6 +20,11 @@
 | `src/dane.py` | DANE baseline |
 | `src/dtformer.py` | DTFormer-style baseline |
 
+说明：
+
+- `dane.py` 与 `dtformer.py` 均以 `paper_approximation` 口径接入统一流水线（见 `summary.json/implementation_fidelity`）。
+- `prepare_datasets.py` 内仍保留部分历史样本构建函数（Amazon/MAG/Twitter 等），但当前工作流不再依赖它们；若后续彻底不需要，可再清理。
+
 ## 3. file 模式约定
 
 - file 模式固定解析 `data/OAG/edges.csv`
@@ -40,10 +45,10 @@
 
 ## 5. 调试建议
 
-先检查 OAG CSV 目录：
+先检查/转换 OAG CSV 目录：
 
 ```bash
-python src/prepare_datasets.py
+python src/prepare_datasets.py --validate-only
 ```
 
 再跑 synthetic：
@@ -55,5 +60,5 @@ python src/edane_full_pipeline.py --mode synthetic
 最后跑 OAG：
 
 ```bash
-python src/edane_full_pipeline.py --mode file --snapshots 3 --max-nodes 3000
+python src/edane_full_pipeline.py --mode file --model edane --snapshots 3 --max-nodes 3000
 ```

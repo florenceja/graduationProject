@@ -65,26 +65,64 @@ OAG 转换口径说明：
 - 转换脚本支持流式扫描 OAG zip；
 - 但当前 `edane_full_pipeline.py` 在 file 模式下仍会一次性读入 CSV，因此**全量 OAG 转换结果未必适合在普通内存环境下直接跑全图**，通常需要结合 `--max-nodes` 使用。
 
+## 对比算法（Baselines）与复现口径
+
+本项目目前支持 3 个可运行的对比/基线模型，通过 `--model` 选择：
+
+- `edane`：本项目算法原型（native 实现）
+- `dane`：DANE（paper_approximation）
+- `dtformer`：DTFormer-style（paper_approximation）
+
+补充：本次调研/讨论中还提到了一个常见强基线 **MTSN（WWW 2021）**，它与 EDANE 的任务定义更接近，但由于其代码生态较旧（TF1/Python2），本仓库目前未直接接入。详见 `docs/baselines.md`。
+
+### 1) DANE（CIKM 2017）
+
+- 论文：Jundong Li, Harsh Dani, Xia Hu, Jiliang Tang, Yi Chang, Huan Liu. **Attributed Network Embedding for Learning in a Dynamic Environment**. CIKM 2017.
+- DOI：10.1145/3132847.3132919；arXiv：https://arxiv.org/abs/1706.01860
+- 代码位置：`src/dane.py`
+- 复现口径：**paper-inspired 近似实现**（`implementation_fidelity=paper_approximation`）
+  - 结构视图与属性视图采用谱嵌入 + 共识融合
+  - 属性图使用 top-k cosine 相似图近似（避免全量相似度）
+  - 在线更新：扰动式更新 + 不稳定时回退 refit
+- 特色：同赛道经典强基线，任务定义接近动态属性网络嵌入
+- 不足/风险：谱分解开销大，对大图不友好；数值稳定性依赖求解器与参数
+
+### 2) DTFormer（CIKM 2024）
+
+- 论文：Xi Chen et al. **DTFormer: A Transformer-Based Method for Discrete-Time Dynamic Graph Representation Learning**. CIKM 2024.
+- DOI：10.1145/3627673.3679568；arXiv：https://arxiv.org/abs/2407.18523
+- Official repo：https://github.com/chenxi1228/DTFormer
+- 代码位置：`src/dtformer.py`
+- 复现口径：**DTFormer-style 适配器**（`implementation_fidelity=paper_approximation`）
+  - 官方 DTFormer 更偏离散时间动态图的链接预测/事件序列训练
+  - 本项目为了统一到 “输出 embedding → 统一评估” 流水线，实现了 paper-inspired 的时序聚合与 patching 思路
+- 特色：满足 “2024+ 前沿对比” 要求
+- 不足/风险：任务/训练目标不完全同构，因此需要在论文中明确是适配版 baseline
+
 ## 快速开始
 
 ```bash
 # 1. 安装依赖
 pip install -r requirements.txt
 
-# 2. 本机先生成可跑子集（推荐）
+# 2. 生成 OAG 子图（推荐先做可跑子集）
 python src/prepare_datasets.py --convert-oag --subset-profile test --overwrite
 
-# 如需更大子集
-python src/prepare_datasets.py --convert-oag --subset-profile small --overwrite
+# 生成更接近正式实验的 OAG 子图（示例：节点>=15000，优先保边）
+python src/prepare_datasets.py --convert-oag --overwrite \
+  --selection-strategy dense --max-papers 15000 --candidate-multiplier 3 \
+  --min-venue-support 5 --keep-unlabeled --max-record-bytes 2000000
 
 # 或仅检查固定数据集 data/OAG
 python src/prepare_datasets.py --validate-only
 
 # 3. 运行实验
-python src/edane_full_pipeline.py --mode synthetic --quantize
-python src/edane_full_pipeline.py --mode file --snapshots 6 --quantize
-python src/edane_full_pipeline.py --mode file --snapshots 6 --quantize --binary-quantize
-python src/edane_full_pipeline.py --mode file --snapshots 6 --quantize --update-rate 100
+python src/edane_full_pipeline.py --mode synthetic --model edane --quantize
+
+# EDANE / DANE / DTFormer 对比（统一在 data/OAG 上）
+python src/edane_full_pipeline.py --mode file --model edane --snapshots 4 --max-nodes 15000
+python src/edane_full_pipeline.py --mode file --model dane --snapshots 4 --max-nodes 15000
+python src/edane_full_pipeline.py --mode file --model dtformer --snapshots 4 --max-nodes 15000
 
 # 消融实验
 python src/edane_full_pipeline.py --mode file --snapshots 6 --quantize --no-attr
@@ -130,8 +168,19 @@ python src/prepare_datasets.py --convert-oag --subset-profile full --overwrite
 但要注意：
 
 - 这更适合高内存/长时间任务环境，不适合普通开发机；
-- 建议至少使用 **128GB+ 内存、NVMe SSD、长时可持续运行环境**；
-- 即使转换完成，当前 `edane_full_pipeline.py` 仍会整读 CSV，因此全量 OAG 主流水线通常还需要进一步做图采样或 `--max-nodes` 限制。
+- 建议至少使用 **128GB+ 内存、NVMe SSD、长时可持续运行环境**（更理想：256GB+）；
+- 本项目当前 file 模式会整读 `edges.csv/features.csv/labels.csv`，因此“全量转换成功”并不等于“可直接全量训练/评估”。
+
+更现实的全量可行方案（推荐写进论文复现说明）：
+
+1. **大机器完成全量转换 → 再做采样子图**（推荐）
+   - 在服务器完成 `--subset-profile full` 或更大规模转换/索引
+   - 再按论文实验设定抽取可训练的子图（例如 1e5~1e6 节点级别）
+2. **重构加载逻辑为流式/分块**（工程量大）
+   - 让 `build_graph_from_files()` 在 `--max-nodes` 前就能完成预筛选/采样
+   - 避免全量 CSV 先进入内存
+3. **改用更适合超大图的图学习框架/存储**（工程量大）
+   - 例如将数据转为 Parquet/Arrow，或使用图数据库/图采样器，再进入训练
 
 输出在 `outputs/stage23_matrix_oag_<timestamp>/`：
 
@@ -150,6 +199,8 @@ python src/prepare_datasets.py --convert-oag --subset-profile full --overwrite
 | [评估指标文档](docs/evaluation_metrics_design_usage.md) | Macro/Micro-F1、AUC、AP、重构与时延指标说明 |
 | [评估设置对比](docs/evaluation_setting_comparison.md) | raw-label 与 cleaned-label 两种分类评估口径的对比与解释 |
 | [模块整合文档](docs/modules_1_4_integrated.md) | 模块一至模块四的统一设计说明 |
+| [对比算法说明](docs/baselines.md) | DANE/DTFormer 等基线的复现口径与限制 |
+| [OAG全量可行方案](docs/oag_full_scale.md) | OAG 采样/全量转换与硬件建议 |
 
 ## 环境要求
 

@@ -170,3 +170,47 @@ $$q_ij = clip(round(z_ij / s_j), -127, 127)$$，其中 $$s_j = max_i |z_ij| / 12
 
 它还不是一个真正面向工业级超大规模图场景的完整工程系统。
 
+---
+
+## 9. OAG 基准构造与对比算法说明
+
+### 9.1 OAG-derived 基准的构造口径
+
+本项目的真实数据实验基于 AMiner Open Platform 来源页提供的 OAG 数据（zip 内 JSONL 论文记录），并转换为统一 CSV：
+
+- `references` → `edges.csv (src,dst,time)`
+- `year` → `time`（用于切分快照的时间代理）
+- `title + abstract + keywords` → `features.csv`（稳定哈希词袋特征，维度可配）
+- `venue` → `labels.csv`（单标签分类代理任务）
+
+重要实现细节（与论文表述一致性相关）：
+
+- **引用边方向不保留**：`build_graph_from_files()` 会将边对规范化为无向边，并构造对称邻接矩阵。
+- **快照切分**：当存在 `time` 时，按时间分位点切分为 `--snapshots` 个窗口；否则按边数均分。
+
+因此建议在论文中将其称为：
+
+> **OAG-derived 动态属性引文网络基准**（proxy task），而非 OAG 官方任务的逐项复刻。
+
+### 9.2 对比算法与复现口径
+
+#### DANE（CIKM 2017）
+
+- 论文：Li et al., CIKM 2017, *Attributed Network Embedding for Learning in a Dynamic Environment*
+- 本项目实现：`src/dane.py`
+- 复现口径：paper-inspired 近似实现（属性相似图 top-k cosine 近似；在线扰动更新 + refit 回退）
+
+#### DTFormer（CIKM 2024）
+
+- 论文：Chen et al., CIKM 2024, *DTFormer: A Transformer-Based Method for Discrete-Time Dynamic Graph Representation Learning*
+- Official repo：https://github.com/chenxi1228/DTFormer
+- 本项目实现：`src/dtformer.py`
+- 复现口径：DTFormer-style adapter（为统一 embedding 评估管线做的 paper-inspired 适配）
+
+#### MTSN（WWW 2021，可选强基线）
+
+- 论文：Liu et al., WWW 2021, *Motif-Preserving Dynamic Attributed Network Embedding*
+- DOI：https://doi.org/10.1145/3442381.3449821
+- 代码：https://github.com/ZhijunLiu95/MTSN
+- 说明：任务定义与动态属性网络嵌入更接近，但其 TF1/Python2 生态较旧，若要接入本项目需额外做较多工程适配。
+

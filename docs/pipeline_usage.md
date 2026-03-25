@@ -54,6 +54,14 @@ python src/edane_full_pipeline.py --mode synthetic --quantize
 python src/prepare_datasets.py --convert-oag --subset-profile test --overwrite
 ```
 
+构造更接近正式实验的子图（示例：节点>=15000，优先保边）：
+
+```bash
+python src/prepare_datasets.py --convert-oag --overwrite \
+  --selection-strategy dense --max-papers 15000 --candidate-multiplier 3 \
+  --min-venue-support 5 --keep-unlabeled --max-record-bytes 2000000
+```
+
 常用 profile：
 
 - `test`：本机测试算法，优先可跑性
@@ -90,10 +98,24 @@ python src/prepare_datasets.py --convert-oag --subset-profile full --overwrite
 然后运行主流水线：
 
 ```bash
-python src/edane_full_pipeline.py --mode file --snapshots 6 --quantize
-python src/edane_full_pipeline.py --mode file --snapshots 6 --classifier logreg --quantize
-python src/edane_full_pipeline.py --mode file --snapshots 6 --classifier logreg --eval-protocol repeated_stratified --eval-repeats 10 --quantize
+python src/edane_full_pipeline.py --mode file --model edane --snapshots 6 --quantize
+python src/edane_full_pipeline.py --mode file --model edane --snapshots 6 --classifier logreg --quantize
+python src/edane_full_pipeline.py --mode file --model edane --snapshots 6 --classifier logreg --eval-protocol repeated_stratified --eval-repeats 10 --quantize
+
+# baseline 对比（同一数据、同一协议）
+python src/edane_full_pipeline.py --mode file --model dane --snapshots 6 --max-nodes 15000
+python src/edane_full_pipeline.py --mode file --model dtformer --snapshots 6 --max-nodes 15000
 ```
+
+模型选择说明：
+
+- `--model edane`：支持 `--quantize/--binary-quantize`、`--no-attr/--no-hyperbolic/--no-inc`
+- `--model dane`：不支持 EDANE 专属消融参数；量化开关不会生效（summary 中会被强制记为 false）
+- `--model dtformer`：不支持 EDANE 专属消融参数；量化开关不会生效（summary 中会被强制记为 false）
+
+输出口径说明：
+
+- `summary.json` 中包含 `implementation_fidelity` 字段：`edane` 为 `native`，基线为 `paper_approximation`
 
 消融实验：
 
@@ -123,6 +145,8 @@ src,dst,time
 u1,u2,1710000000
 u2,u5,1710003600
 ```
+
+注意：当前 `build_graph_from_files()` 会把边对规范化为无向图（引用边方向会被丢弃），并在有 `time` 时按分位点切分快照。
 
 ### 5.2 `features.csv`
 

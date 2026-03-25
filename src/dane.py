@@ -73,7 +73,7 @@ def _generalized_spectral_embedding(adj_like: SparseMatrix, dim: int, seed: int)
     laplacian = sparse.csr_matrix(sparse.diags(degree, format="csr") - adj_like, dtype=np.float64)
     degree_safe = sparse.csr_matrix(sparse.diags(np.maximum(degree, 1.0), format="csr"), dtype=np.float64)
 
-    take = min(max(dim + 1, 2), max(n - 1, 1))
+    take = min(max(dim + 1, 2), max(n - 2, 1))
     if n <= dim + 2:
         lap_dense = laplacian.toarray()
         deg_dense = degree_safe.toarray()
@@ -81,20 +81,40 @@ def _generalized_spectral_embedding(adj_like: SparseMatrix, dim: int, seed: int)
     else:
         rng = np.random.default_rng(seed)
         v0 = rng.normal(size=n)
+        ncv = min(max(2 * take + 1, 20), n - 1)
         try:
             evals, evecs = sparse_linalg.eigsh(
                 laplacian,
                 k=take,
                 M=degree_safe,
-                which="SM",
-                maxiter=max(4000, 10 * n),
+                which="SA",
+                maxiter=max(6000, 12 * n),
+                ncv=ncv,
                 v0=v0,
             )
         except Exception:
             inv_sqrt = 1.0 / np.sqrt(np.maximum(degree, 1.0))
             norm_adj = sparse.diags(inv_sqrt, format="csr") @ adj_like @ sparse.diags(inv_sqrt, format="csr")
             norm_lap = sparse.eye(n, format="csr") - norm_adj
-            evals, evecs = sparse_linalg.eigsh(norm_lap, k=take, which="SM", maxiter=max(4000, 10 * n), v0=v0)
+            try:
+                evals, evecs = sparse_linalg.eigsh(
+                    norm_lap,
+                    k=take,
+                    which="SA",
+                    maxiter=max(6000, 12 * n),
+                    ncv=ncv,
+                    v0=v0,
+                )
+            except Exception:
+                # 最后兜底：LOBPCG（更适合大规模 SPD 的最小特征对）
+                x0 = rng.normal(size=(n, take))
+                evals, evecs = sparse_linalg.lobpcg(
+                    norm_lap,
+                    x0,
+                    largest=False,
+                    maxiter=200,
+                    tol=1e-3,
+                )
 
     order = np.argsort(evals)
     evals = np.asarray(evals[order], dtype=np.float64)

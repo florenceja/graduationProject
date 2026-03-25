@@ -46,6 +46,14 @@ dataset/OAG/
 python src/prepare_datasets.py --convert-oag --subset-profile test --overwrite
 ```
 
+如果需要构造更接近正式实验的子图（示例：节点>=15000，优先保边）：
+
+```bash
+python src/prepare_datasets.py --convert-oag --overwrite \
+  --selection-strategy dense --max-papers 15000 --candidate-multiplier 3 \
+  --min-venue-support 5 --keep-unlabeled --max-record-bytes 2000000
+```
+
 如果换到更强设备并尝试全量转换：
 
 ```bash
@@ -69,9 +77,13 @@ python src/edane_full_pipeline.py --mode synthetic --quantize
 ### 3.2 OAG 文件模式
 
 ```bash
-python src/edane_full_pipeline.py --mode file --snapshots 3 --max-nodes 3000 --quantize
-python src/edane_full_pipeline.py --mode file --snapshots 6 --classifier logreg --quantize
-python src/edane_full_pipeline.py --mode file --snapshots 6 --classifier logreg --quantize --no-inc
+python src/edane_full_pipeline.py --mode file --model edane --snapshots 3 --max-nodes 3000 --quantize
+python src/edane_full_pipeline.py --mode file --model edane --snapshots 6 --classifier logreg --quantize
+python src/edane_full_pipeline.py --mode file --model edane --snapshots 6 --classifier logreg --quantize --no-inc
+
+# baseline 对比
+python src/edane_full_pipeline.py --mode file --model dane --snapshots 3 --max-nodes 15000
+python src/edane_full_pipeline.py --mode file --model dtformer --snapshots 3 --max-nodes 15000
 ```
 
 ### 3.3 阶段2/3矩阵实验

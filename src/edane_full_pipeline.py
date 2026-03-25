@@ -881,10 +881,15 @@ def save_metrics_curves_svg(metrics_rows: List[Dict[str, float]], output_path: s
 
 _ALL_RESULTS_COLUMN_MAPPINGS = [
     ("dataset", ("dataset",)),
+    ("model", ("model", "algorithm", "algo")),
+    ("fidelity", ("fidelity", "implementation_fidelity")),
+    ("snapshot_mode", ("snapshot_mode",)),
     ("variant", ("variant", "ablation_tag")),
     ("binary", ("binary", "binary_quantize")),
     ("update_rate", ("update_rate",)),
     ("nodes", ("nodes", "num_nodes")),
+    ("dim", ("dim", "embedding_dim")),
+    ("snapshots", ("snapshots", "num_snapshots")),
     ("init_ms", ("init_ms", "initialization_latency_ms")),
     ("update_ms", ("update_ms", "avg_update_latency_ms")),
     ("macro_f1", ("macro_f1", "final_macro_f1")),
@@ -892,6 +897,7 @@ _ALL_RESULTS_COLUMN_MAPPINGS = [
     ("link_auc", ("link_auc", "final_link_auc")),
     ("link_ap", ("link_ap", "final_link_ap")),
     ("recon_auc", ("recon_auc", "final_reconstruction_auc")),
+    ("eff_rate", ("eff_rate", "effective_update_rate")),
     ("compression_x", ("compression_x", "quantization_compression_ratio")),
 ]
 
@@ -934,11 +940,16 @@ def _append_to_all_results(
                 )
 
     new_row = {
-        "dataset": dataset_tag,
+        "dataset": summary.get("dataset", dataset_tag),
+        "model": summary.get("model", ""),
+        "fidelity": summary.get("implementation_fidelity", ""),
+        "snapshot_mode": summary.get("snapshot_mode", ""),
         "variant": summary.get("ablation_tag", ""),
         "binary": summary.get("binary_quantize", ""),
         "update_rate": summary.get("update_rate", ""),
         "nodes": summary.get("num_nodes", ""),
+        "dim": summary.get("embedding_dim", ""),
+        "snapshots": summary.get("num_snapshots", ""),
         "init_ms": summary.get("initialization_latency_ms", ""),
         "update_ms": summary.get("avg_update_latency_ms", ""),
         "macro_f1": summary.get("final_macro_f1", ""),
@@ -946,6 +957,7 @@ def _append_to_all_results(
         "link_auc": summary.get("final_link_auc", ""),
         "link_ap": summary.get("final_link_ap", ""),
         "recon_auc": summary.get("final_reconstruction_auc", ""),
+        "eff_rate": summary.get("effective_update_rate", ""),
         "compression_x": summary.get("quantization_compression_ratio", ""),
     }
     existing_rows.append(new_row)
