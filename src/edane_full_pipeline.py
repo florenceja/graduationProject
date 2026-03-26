@@ -27,6 +27,12 @@ from edane import EDANE, cosine_scores
 AdjLike = Union[np.ndarray, sparse.csr_matrix]
 
 
+def _progress(message: str) -> None:
+    """统一进度输出，避免长任务期间终端无反馈。"""
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {message}", flush=True)
+
+
 @dataclass
 class DynamicBatch:
     """单个快照增量事件包。"""
@@ -204,6 +210,7 @@ def softmax_logreg_predict(
     weight_decay: float = 1e-4,
     seed: int = 42,
     class_weight_mode: str = "none",
+    progress_tag: str = "",
 ) -> np.ndarray:
     """使用 NumPy 训练多分类 softmax 逻辑回归并预测。
 
@@ -238,7 +245,13 @@ def softmax_logreg_predict(
         sample_weights = class_weights[y_idx]
     normalizer = float(np.sum(sample_weights))
 
-    for _ in range(max(20, epochs)):
+    total_epochs = max(20, int(epochs))
+    # Only print training progress for larger / multi-class problems.
+    progress_every = 0
+    if len(train_x) >= 3000 or num_classes >= 200:
+        progress_every = max(total_epochs // 4, 1)
+
+    for ep in range(1, total_epochs + 1):
         probs = _softmax(x_train_b @ w)
         weighted_errors = (probs - y_onehot) * sample_weights[:, None]
         grad = (x_train_b.T @ weighted_errors) / max(normalizer, 1e-12)
@@ -246,6 +259,10 @@ def softmax_logreg_predict(
         reg = weight_decay * w
         reg[-1, :] = 0.0
         w -= lr * (grad + reg)
+
+        if progress_every > 0 and (ep == 1 or ep % progress_every == 0 or ep == total_epochs):
+            tag = (progress_tag + " ") if progress_tag else ""
+            _progress(f"{tag}logreg epoch {ep}/{total_epochs} (train_n={len(train_x)}, classes={num_classes})")
 
     pred_idx = np.argmax(x_test_b @ w, axis=1)
     return classes[pred_idx]
@@ -347,12 +364,18 @@ def evaluate_snapshot(
     logreg_class_weight: str,
 ) -> Dict[str, Union[float, str]]:
     """评估当前快照上的节点分类、链路预测与网络重构指标。"""
+    eval_started = time.perf_counter()
     eval_labels, label_meta = prepare_labels_for_evaluation(
         labels,
         cleanup_mode=label_cleanup_mode,
         min_class_support=min_class_support,
     )
     valid_nodes = np.where(eval_labels >= 0)[0]
+    unique_eval_classes = np.unique(eval_labels[valid_nodes]) if len(valid_nodes) > 0 else np.array([], dtype=np.int64)
+    _progress(
+        f"F1 eval prep: labeled_nodes={len(valid_nodes)}, classes={len(unique_eval_classes)}, "
+        f"cleanup_mode={label_cleanup_mode}, min_class_support={max(int(min_class_support), 2)}"
+    )
     metrics: Dict[str, Union[float, str]] = {
         "macro_f1": 0.0,
         "micro_f1": 0.0,
@@ -374,18 +397,27 @@ def evaluate_snapshot(
         total_repeats = max(eval_repeats, 1) if eval_protocol == "repeated_stratified" else 1
         for repeat in range(total_repeats):
             split_seed = seed + repeat
+            if total_repeats > 1:
+                _progress(f"F1 repeat {repeat + 1}/{total_repeats}: splitting (protocol={eval_protocol})")
             if eval_protocol == "repeated_stratified":
                 split = stratified_train_test_split(eval_labels, valid_nodes, train_ratio=eval_train_ratio, seed=split_seed)
                 if split is None:
                     protocol_used = "single_random_fallback"
+                    _progress("Stratified split failed; falling back to single_random split")
                     split = train_test_split(valid_nodes, train_ratio=eval_train_ratio, seed=split_seed)
             else:
                 split = train_test_split(valid_nodes, train_ratio=eval_train_ratio, seed=split_seed)
 
             train_idx, test_idx = split
             if len(train_idx) == 0 or len(test_idx) == 0 or len(np.unique(eval_labels[train_idx])) < 2:
+                _progress("F1 split skipped: empty train/test or <2 classes in train")
                 continue
             if classifier == "logreg":
+                if len(train_idx) >= 3000 or len(np.unique(eval_labels[train_idx])) >= 200:
+                    _progress(
+                        f"Training logreg: train_n={len(train_idx)}, test_n={len(test_idx)}, "
+                        f"classes={len(np.unique(eval_labels[train_idx]))}, epochs={int(logreg_epochs)}"
+                    )
                 pred = softmax_logreg_predict(
                     train_x=embedding[train_idx],
                     train_y=eval_labels[train_idx],
@@ -395,12 +427,16 @@ def evaluate_snapshot(
                     weight_decay=logreg_weight_decay,
                     seed=split_seed,
                     class_weight_mode=logreg_class_weight,
+                    progress_tag=f"repeat {repeat + 1}/{total_repeats}" if total_repeats > 1 else "",
                 )
             else:
                 pred = nearest_centroid_predict(embedding, eval_labels, train_idx, test_idx)
             macro, micro = macro_micro_f1(eval_labels[test_idx], pred)
             macro_scores.append(macro)
             micro_scores.append(micro)
+
+            if total_repeats > 1:
+                _progress(f"F1 repeat {repeat + 1}/{total_repeats} done: macro_f1={macro:.4f}, micro_f1={micro:.4f}")
 
         metrics["f1_eval_protocol"] = protocol_used
         metrics["f1_eval_successful_repeats"] = float(len(macro_scores))
@@ -420,6 +456,12 @@ def evaluate_snapshot(
     recon_pos_scores = cosine_scores(embedding, recon_pos_pairs) if recon_pos_pairs else np.array([], dtype=np.float64)
     recon_neg_scores = cosine_scores(embedding, recon_neg_pairs) if recon_neg_pairs else np.array([], dtype=np.float64)
     metrics["reconstruction_auc"] = auc_from_scores(recon_pos_scores, recon_neg_scores)
+
+    elapsed = time.perf_counter() - eval_started
+    _progress(
+        f"Evaluation done: macro_f1={float(metrics['macro_f1']):.4f}, micro_f1={float(metrics['micro_f1']):.4f}, "
+        f"link_auc={float(metrics['link_auc']):.4f}, recon_auc={float(metrics['reconstruction_auc']):.4f} ({elapsed:.1f}s)"
+    )
     return metrics
 
 
@@ -445,12 +487,38 @@ def parse_time_value(value: str) -> float:
 
 
 def read_csv_dict(path: str) -> List[Dict[str, str]]:
-    """读取 CSV 为字典列表，自动兼容 UTF-8 BOM。"""
+    """读取 CSV 为字典列表，自动兼容 UTF-8 BOM。
+
+    说明：当前流水线会整读 CSV（与现有内存口径一致）。为了避免大文件时终端长时间无输出，
+    这里会在文件较大时周期性打印“已读取行数”。
+    """
+    started = time.perf_counter()
+    try:
+        file_size = int(os.path.getsize(path))
+    except OSError:
+        file_size = 0
+
+    # Print periodic progress only for larger files.
+    report_every = 0
+    if file_size >= 64 * 1024 * 1024:
+        report_every = 200_000
+    elif file_size >= 8 * 1024 * 1024:
+        report_every = 50_000
+
+    rows: List[Dict[str, str]] = []
     with open(path, "r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
         if reader.fieldnames is None:
             raise ValueError(f"CSV has no header: {path}")
-        return [row for row in reader]
+        for idx, row in enumerate(reader, start=1):
+            rows.append(row)
+            if report_every > 0 and idx % report_every == 0:
+                elapsed = time.perf_counter() - started
+                _progress(f"Reading {os.path.basename(path)}: loaded {idx} rows ({elapsed:.1f}s)")
+
+    elapsed = time.perf_counter() - started
+    _progress(f"Done {os.path.basename(path)}: {len(rows)} rows ({elapsed:.1f}s)")
+    return rows
 
 
 def parse_numeric_vector(
@@ -493,6 +561,14 @@ def build_graph_from_files(
     - 动态批次列表 batches
     - 节点 ID 到索引映射 node_to_idx
     """
+    _progress(
+        "Building graph input (file mode loads full CSVs): "
+        f"edges={os.path.basename(edges_path)}, "
+        f"features={os.path.basename(features_path) if features_path else 'None'}, "
+        f"labels={os.path.basename(labels_path) if labels_path else 'None'}, "
+        f"attr_updates={os.path.basename(attr_updates_path) if attr_updates_path else 'None'}"
+    )
+    _progress("Loading edges.csv ...")
     edge_rows = read_csv_dict(edges_path)
     if len(edge_rows) == 0:
         raise ValueError("边文件为空，至少需要一条边。")
@@ -517,6 +593,7 @@ def build_graph_from_files(
     feature_map: Dict[str, np.ndarray] = {}
     feature_dim = 0
     if features_path:
+        _progress("Loading features.csv ...")
         feature_rows = read_csv_dict(features_path)
         if len(feature_rows) > 0:
             if "node_id" not in feature_rows[0]:
@@ -538,6 +615,7 @@ def build_graph_from_files(
 
     label_map: Dict[str, int] = {}
     if labels_path:
+        _progress("Loading labels.csv ...")
         label_rows = read_csv_dict(labels_path)
         if len(label_rows) > 0:
             if "node_id" not in label_rows[0] or "label" not in label_rows[0]:
@@ -553,6 +631,7 @@ def build_graph_from_files(
     # max_nodes <= 0 表示不限制。
     original_num_nodes = len(node_ids)
     if max_nodes > 0 and original_num_nodes > max_nodes:
+        _progress(f"Downsampling for memory safety: nodes {original_num_nodes} -> max_nodes={max_nodes}")
         degree_counter: Dict[str, int] = {}
         for src, dst, _ in temporal_edges:
             degree_counter[src] = degree_counter.get(src, 0) + 1
@@ -563,9 +642,9 @@ def build_graph_from_files(
         feature_map = {k: v for k, v in feature_map.items() if k in selected_nodes}
         label_map = {k: v for k, v in label_map.items() if k in selected_nodes}
         node_ids = selected_nodes
-        print(
-            f"[内存保护] 节点数从 {original_num_nodes} 下采样到 {len(node_ids)}，"
-            f"请用 --max-nodes 调整（0 为不限制）。"
+        _progress(
+            f"[memory] downsampled nodes {original_num_nodes} -> {len(node_ids)}; "
+            "use --max-nodes to adjust (0 = no limit)"
         )
 
     if len(temporal_edges) == 0:
@@ -574,6 +653,8 @@ def build_graph_from_files(
     sorted_nodes = sorted(node_ids)
     node_to_idx = {node_id: idx for idx, node_id in enumerate(sorted_nodes)}
     num_nodes = len(sorted_nodes)
+
+    _progress(f"Graph stats: num_nodes={num_nodes}, temporal_edges={len(temporal_edges)}, has_time={has_time}")
 
     if feature_dim == 0:
         feature_dim = 16
@@ -590,6 +671,7 @@ def build_graph_from_files(
         labels[node_to_idx[node]] = label
 
     # ---- 1) 根据时间构造快照边集 ----
+    _progress(f"Building snapshots: snapshots={snapshots}, snapshot_mode={snapshot_mode}")
     temporal_edges.sort(key=lambda x: x[2])
     if snapshots < 2 or not has_time:
         snapshots = max(2, snapshots)
@@ -627,6 +709,7 @@ def build_graph_from_files(
     # ---- 2) 将属性更新按时间分桶到对应快照 ----
     attr_update_bins: List[Dict[int, np.ndarray]] = [dict() for _ in range(len(snapshot_edge_sets))]
     if attr_updates_path:
+        _progress("Loading attr_updates.csv ...")
         attr_rows = read_csv_dict(attr_updates_path)
         if len(attr_rows) > 0:
             required = {"time", "node_id"}
@@ -662,6 +745,7 @@ def build_graph_from_files(
                 attr_update_bins[bin_idx][node_to_idx[node]] = vec
 
     # ---- 3) 生成初始图 + 每个快照的增量事件 ----
+    _progress("Building initial adjacency and per-snapshot update batches ...")
     first_edges = snapshot_edge_sets[0]
     row_idx: List[int] = []
     col_idx: List[int] = []
@@ -1096,8 +1180,16 @@ def run_pipeline(args: argparse.Namespace) -> None:
     out_dir = args.output_dir or os.path.join(project_root, "outputs", f"{tag}_{timestamp}")
     ensure_dir(out_dir)
 
+    _progress(
+        "Pipeline start: "
+        f"mode={args.mode}, model={args.model}, snapshots={args.snapshots}, "
+        f"snapshot_mode={args.snapshot_mode}, max_nodes={args.max_nodes}, seed={args.seed}"
+    )
+
     if args.mode == "file":
+        _progress("File mode: using fixed dataset dir data/OAG/ ...")
         args.edges_path, args.features_path, args.labels_path, args.attr_updates_path = _resolve_oag_dataset_paths(project_root)
+        _progress("Preparing graph and dynamic snapshots ...")
         adj, attrs, labels, batches, node_to_idx = build_graph_from_files(
             edges_path=args.edges_path,
             features_path=args.features_path,
@@ -1117,12 +1209,16 @@ def run_pipeline(args: argparse.Namespace) -> None:
         )
 
     # 初始化嵌入模型。
+    _progress("Building model ...")
     model = build_model(args)
 
+    _progress("Initial fit() ...")
     start = time.perf_counter()
     model.fit(adj, attrs)
     init_latency_ms = (time.perf_counter() - start) * 1000.0
+    _progress(f"Initial fit() done: {init_latency_ms:.1f} ms")
     emb = model.get_embedding(dequantize=False)
+    _progress("Evaluating snapshot=0 ...")
     metrics0 = evaluate_snapshot(
         emb,
         labels,
@@ -1156,11 +1252,15 @@ def run_pipeline(args: argparse.Namespace) -> None:
     state_adj = sparse.csr_matrix(adj, dtype=np.float64)
     state_attrs = np.asarray(attrs, dtype=np.float64).copy()
     for i, batch in enumerate(batches, start=1):
+        event_count = _count_batch_events(batch)
+        _progress(f"Snapshot {i}/{len(batches)}: batch_events={event_count}")
         start = time.perf_counter()
         if args.no_inc:
+            _progress("w/o-Inc: applying batch and refitting ...")
             state_adj, state_attrs = _apply_batch_to_graph(state_adj, state_attrs, batch)
             model.fit(state_adj, state_attrs)
         else:
+            _progress("Incremental update: apply_updates() ...")
             model.apply_updates(
                 edge_additions=batch.edge_additions,
                 edge_removals=batch.edge_removals,
@@ -1170,13 +1270,14 @@ def run_pipeline(args: argparse.Namespace) -> None:
         latency_s = compute_latency_s
 
         wait_ms = 0.0
-        event_count = _count_batch_events(batch)
         if args.update_rate > 0 and event_count > 0:
             target_s = event_count / float(args.update_rate)
             if latency_s < target_s:
                 wait_ms = (target_s - latency_s) * 1000.0
                 time.sleep(target_s - latency_s)
                 latency_s = target_s
+
+        _progress(f"Snapshot {i}: update done compute={compute_latency_s:.2f}s, wait={wait_ms:.1f}ms")
 
         latency_ms = latency_s * 1000.0
         compute_latency_ms = compute_latency_s * 1000.0
@@ -1187,6 +1288,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
         total_update_wall_s += latency_s
 
         emb = model.get_embedding(dequantize=False)
+        _progress(f"Evaluating snapshot={i} ...")
         metrics = evaluate_snapshot(
             emb,
             labels,
@@ -1332,14 +1434,14 @@ def run_pipeline(args: argparse.Namespace) -> None:
     # 自动追加到项目根目录的 all_results.csv 汇总表。
     _append_to_all_results(project_root, tag, summary)
 
-    print(f"{args.model.upper()} 全流程实验完成")
+    print(f"{args.model.upper()} pipeline run completed")
     print("=" * 50)
     for k, v in summary.items():
         print(f"{k}: {v}")
     print("=" * 50)
-    print(f"指标明细: {os.path.join(out_dir, 'metrics_per_snapshot.csv')}")
-    print(f"曲线图: {curves_path}")
-    print(f"汇总表: {os.path.join(project_root, 'all_results.csv')}")
+    print(f"Metrics CSV: {os.path.join(out_dir, 'metrics_per_snapshot.csv')}")
+    print(f"Curves SVG: {curves_path}")
+    print(f"All results: {os.path.join(project_root, 'all_results.csv')}")
 
 
 def build_parser() -> argparse.ArgumentParser:
