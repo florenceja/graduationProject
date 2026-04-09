@@ -1,0 +1,43 @@
+# 你的文档
+陈红_调研报告.docx
+nul
+dataset/nul
+dataset/
+outputs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*.pyd
+
+# 模型 / 大文件（必屏蔽，否则传不上去）
+*.pth
+*.pt
+*.bin
+*.ckpt
+*.h5
+*.model
+*.pkl
+*.pickle
+*.zip
+*.rar
+*.7z
+*.tar
+*.tar.gz
+*.gz
+*.bz2
+
+# 缓存 / 临时文件
+.cache/
+tmp/
+temp/
+*.tmp
+*.log
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
